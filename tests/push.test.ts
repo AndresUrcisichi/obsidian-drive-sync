@@ -111,18 +111,33 @@ describe('push', () => {
 			[created.path, created],
 			[modified.path, modified],
 			[unchanged.path, unchanged],
+			['theirs.md', Object.assign(new TFile(), { path: 'theirs.md', name: 'theirs.md', parent: root })],
+			['orphan.md', Object.assign(new TFile(), { path: 'orphan.md', name: 'orphan.md', parent: root })],
 		]);
 		const syncNotice = { setMessage: vi.fn(), hide: vi.fn() };
 		const drive = {
 			searchFiles: vi.fn().mockResolvedValueOnce([]),
-			getChanges: vi.fn(async () => ({
-				changes: [],
-				newStartPageToken: 'next',
-			})),
+			getChanges: vi
+				.fn()
+				.mockResolvedValueOnce({ changes: [], newStartPageToken: 'next' })
+				// Another device edited theirs.md after our pull.
+				.mockResolvedValueOnce({
+					changes: [
+						{
+							fileId: 'theirs-id',
+							removed: false,
+							file: { id: 'theirs-id', md5Checksum: 'remote-new' },
+						},
+					],
+					newStartPageToken: 'later',
+				}),
 			batchDelete: vi.fn(async () => true),
 			getRootFolderId: vi.fn(async () => 'root-id'),
 			createFolder: vi.fn(async () => 'folder-id'),
-			uploadFile: vi.fn(async () => ({ id: 'created-id', md5Checksum: 'm1' })),
+			uploadFile: vi.fn(async (_blob: Blob, name: string) => ({
+				id: name === 'new.md' ? 'created-id' : `${name}-id`,
+				md5Checksum: 'm1',
+			})),
 			updateFile: vi.fn(async () => ({ id: 'changed-id', md5Checksum: 'm2' })),
 			getConfigFilesToSync: vi.fn(async () => []),
 		};
@@ -148,11 +163,14 @@ describe('push', () => {
 					'changed.md': 'modify',
 					'unchanged.md': 'modify',
 					'never-synced.md': 'delete',
+					'theirs.md': 'modify',
+					'orphan.md': 'modify',
 				} as Record<string, string>,
 				driveIdToPath: {
 					'deleted-id': 'deleted.md',
 					'changed-id': 'changed.md',
 					'unchanged-id': 'unchanged.md',
+					'theirs-id': 'theirs.md',
 				} as Record<string, string>,
 				driveIdToMd5: {
 					'unchanged-id': md5(new Uint8Array(1)),
@@ -163,6 +181,8 @@ describe('push', () => {
 			drive,
 			manifest: { id: 'gdrive-vault-sync' },
 			touchedDuringSync: new Set<string>(),
+			clearAutoPushTimer: vi.fn(),
+			resumeAutoPushIfNeeded: vi.fn(),
 			saveSettings: vi.fn(async () => undefined),
 			startSync: vi.fn(async () => syncNotice),
 			endSync: vi.fn(async () => {
@@ -177,7 +197,13 @@ describe('push', () => {
 		expect(drive.batchDelete).toHaveBeenCalledWith(['deleted-id']);
 		expect(drive.getRootFolderId).toHaveBeenCalledWith(true);
 		expect(drive.createFolder).toHaveBeenCalled();
-		expect(drive.uploadFile).toHaveBeenCalled();
+		// A "modify" with no Drive ID is uploaded as a new file.
+		expect(drive.uploadFile).toHaveBeenCalledWith(
+			expect.any(Blob),
+			'orphan.md',
+			undefined,
+			expect.any(Object),
+		);
 		expect(drive.updateFile).toHaveBeenCalledOnce();
 		expect(drive.updateFile).toHaveBeenCalledWith(
 			'changed-id',
@@ -187,7 +213,8 @@ describe('push', () => {
 		expect(plugin.settings.driveIdToPath['created-id']).toBe('folder/new.md');
 		expect(plugin.settings.driveIdToMd5['created-id']).toBe('m1');
 		expect(plugin.settings.driveIdToMd5['changed-id']).toBe('m2');
-		expect(plugin.settings.operations).toEqual({});
+		// Deferred: the next pull keeps both versions.
+		expect(plugin.settings.operations).toEqual({ 'theirs.md': 'modify' });
 		expect(plugin.endSync).toHaveBeenCalledWith(syncNotice, false);
 	});
 });

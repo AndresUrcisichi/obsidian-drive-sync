@@ -227,6 +227,92 @@ describe('pull (incremental)', () => {
 		expect(notices.some((n) => n.includes('conflict'))).toBe(true);
 	});
 
+	it('takes the remote version when a pending op is stale', async () => {
+		const { plugin, files, remoteContents } = createPlugin({ 'a.md': 'base' });
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('base') };
+		// For example a save that did not change the bytes.
+		plugin.settings.operations = { 'a.md': 'modify' };
+		remoteContents.set('a-id', 'theirs');
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{ fileId: 'a-id', removed: false, file: remote('a-id', 'a.md', 'theirs') },
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.modifyFile).toHaveBeenCalledWith(
+			files.get('a.md'),
+			expect.any(ArrayBuffer),
+			'2026-11-01T00:00:00.000Z',
+		);
+		expect(plugin.settings.operations).toEqual({});
+		expect(notices.some((n) => n.includes('conflict'))).toBe(false);
+	});
+
+	it('revives a locally deleted folder when Drive has a newer file inside', async () => {
+		const { plugin, remoteContents } = createPlugin();
+		plugin.settings.driveIdToPath = { 'f-id': 'F', 'a-id': 'F/a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('old') };
+		plugin.settings.operations = { F: 'delete', 'F/a.md': 'delete' };
+		remoteContents.set('a-id', 'edited elsewhere');
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{
+					fileId: 'a-id',
+					removed: false,
+					file: remote('a-id', 'F/a.md', 'edited elsewhere'),
+				},
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.settings.operations).toEqual({});
+		expect(plugin.createFolder).toHaveBeenCalledWith('F');
+		expect(plugin.upsertFile).toHaveBeenCalledWith(
+			'F/a.md',
+			expect.any(ArrayBuffer),
+			'2026-11-01T00:00:00.000Z',
+		);
+	});
+
+	it('does not mark hidden files that are still on disk as deleted', async () => {
+		const { plugin } = createPlugin();
+		plugin.settings.driveIdToPath = { 'c-id': '.obsidian/app.json' };
+		plugin.app.vault.adapter.exists.mockImplementation(
+			async (path: string) => path === '.obsidian/app.json',
+		);
+
+		await pull(plugin as never, true);
+
+		expect(plugin.settings.operations).toEqual({});
+	});
+
+	it('leaves config files alone when settings sync is off', async () => {
+		const { plugin } = createPlugin();
+		plugin.settings.syncConfig = false;
+		plugin.settings.driveIdToPath = { 'x-id': 'x.md' };
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{
+					fileId: 'c-id',
+					removed: false,
+					file: remote('c-id', 'config/app.json', '{}', { config: 'true' }),
+				},
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.drive.getFile).not.toHaveBeenCalled();
+		expect(plugin.upsertFile).not.toHaveBeenCalled();
+	});
+
 	it('trashes remotely deleted files but keeps ones with local edits', async () => {
 		const { plugin, files } = createPlugin({
 			'gone.md': 'x',

@@ -61,7 +61,7 @@ describe('Drive batch deletion', () => {
 			async ({ body }: { body?: string | ArrayBuffer }) => {
 				const requestBody = typeof body === 'string' ? body : '';
 				const requestCount =
-					requestBody.match(/^DELETE /gm)?.length ?? 0;
+					requestBody.match(/^PATCH /gm)?.length ?? 0;
 				return {
 					status: 200,
 					headers: {},
@@ -92,9 +92,12 @@ describe('Drive batch deletion', () => {
 		expect(boundary).toBeTruthy();
 		expect(request.body).toContain(`--${boundary}`);
 		expect(request.body).toContain('Content-Type: application/http');
+		// Trash, not permanent delete: recoverable from Drive for 30 days.
 		expect(request.body).toContain(
-			'DELETE /drive/v3/files/file-1 HTTP/1.1',
+			'PATCH /drive/v3/files/file-1?fields=id HTTP/1.1',
 		);
+		expect(request.body).toContain('{"trashed":true}');
+		expect(request.body).not.toMatch(/^DELETE /m);
 		expect(request.body).not.toContain('Content-Disposition: form-data');
 		expect(request.body).toMatch(new RegExp(`--${boundary}--\\r\\n$`));
 	});
@@ -117,8 +120,8 @@ describe('Drive batch deletion', () => {
 			typeof secondRequest?.body === 'string' ? secondRequest.body : '';
 
 		expect(requestUrl).toHaveBeenCalledTimes(2);
-		expect(firstBody.match(/^DELETE /gm)).toHaveLength(100);
-		expect(secondBody.match(/^DELETE /gm)).toHaveLength(1);
+		expect(firstBody.match(/^PATCH /gm)).toHaveLength(100);
+		expect(secondBody.match(/^PATCH /gm)).toHaveLength(1);
 	});
 
 	it('fails when any nested deletion fails', async () => {
@@ -199,7 +202,56 @@ describe('Drive root folder persistence', () => {
 	});
 });
 
+describe('idempotent creates', () => {
+	it('sends a reserved ID and adopts it when a retried create errors', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => undefined);
+		const plugin = createPlugin();
+		requestUrl.mockReset();
+		requestUrl.mockImplementation(async ({ url }: { url: string }) => {
+			const ok = (json: unknown) => ({
+				status: 200,
+				headers: {},
+				arrayBuffer: new ArrayBuffer(0),
+				json,
+				text: '',
+			});
+			if (url.includes('generateIds')) return ok({ ids: ['reserved-1'] });
+			if (url.includes('/files/reserved-1')) {
+				return ok({ id: 'reserved-1', md5Checksum: 'abc' });
+			}
+			if (url.includes('upload/drive/v3/files')) {
+				// The first attempt landed but its response was lost.
+				return { ...ok({}), status: 409 };
+			}
+			return ok({ id: 'root', files: [{ id: 'root' }] });
+		});
+		const drive = getDriveClient(plugin);
+
+		await expect(
+			drive.uploadFile(new Blob(['x']), 'a.md', 'parent-id'),
+		).resolves.toEqual({ id: 'reserved-1', md5Checksum: 'abc' });
+	});
+});
+
 describe('batchAsync', () => {
+	it('stops starting tasks after a failure and waits for running ones', async () => {
+		const started: number[] = [];
+		let running = 0;
+		const tasks = Array.from({ length: 10 }, (_, i) => async () => {
+			started.push(i);
+			running++;
+			await new Promise((resolve) => window.setTimeout(resolve, 5));
+			running--;
+			if (i === 1) throw new Error('boom');
+			return i;
+		});
+
+		await expect(batchAsync(tasks, 2)).rejects.toThrow('boom');
+
+		expect(running).toBe(0);
+		expect(started.length).toBeLessThan(10);
+	});
+
 	it('never runs more than the concurrency limit and keeps order', async () => {
 		let running = 0;
 		let peak = 0;

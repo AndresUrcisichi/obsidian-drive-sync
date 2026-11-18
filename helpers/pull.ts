@@ -81,9 +81,13 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 				.filter((path) => path !== '/'),
 		);
 
-		cloudSet.forEach((path) => {
-			if (!localSet.has(path)) t.settings.operations[path] = 'delete';
-		});
+		// Hidden or not-yet-indexed files (for example another device's
+		// config folder) are missing from the index but still on disk.
+		for (const path of cloudSet) {
+			if (!localSet.has(path) && !(await adapter.exists(path))) {
+				t.settings.operations[path] = 'delete';
+			}
+		}
 
 		for (const path in t.settings.operations) {
 			if (isConfig(path)) continue;
@@ -156,6 +160,7 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 		upserts = upserts.filter(
 			({ properties, mimeType }) =>
 				properties?.obsidian !== 'vault' &&
+				(t.settings.syncConfig || properties?.config !== 'true') &&
 				// Native Docs/Sheets have no downloadable bytes.
 				(mimeType === folderMimeType ||
 					!mimeType?.startsWith('application/vnd.google-apps.')),
@@ -188,7 +193,7 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 				return;
 			}
 			if (isConfig(path)) {
-				configToRemove.push(path);
+				if (t.settings.syncConfig) configToRemove.push(path);
 				return;
 			}
 			const file = vault.getAbstractFileByPath(path);
@@ -258,6 +263,42 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 		let completed = 0;
 		let conflicts = 0;
 
+		/**
+		 * A remote change under a folder deleted locally revives that folder:
+		 * otherwise the pending folder delete would trash the new remote edit.
+		 */
+		const reviveAncestors = async (path: string) => {
+			const parts = path.split('/');
+			for (let i = 1; i < parts.length; i++) {
+				const folder = parts.slice(0, i).join('/');
+				if (t.settings.operations[folder] === 'delete') {
+					delete t.settings.operations[folder];
+				}
+				if (await adapter.exists(folder)) continue;
+				try {
+					await t.createFolder(folder);
+				} catch (error) {
+					// Another worker may have created it meanwhile.
+					if (!(await adapter.exists(folder))) throw error;
+				}
+			}
+		};
+
+		const readLocal = async (path: string) => {
+			const file = vault.getFileByPath(path);
+			return file ? vault.readBinary(file) : adapter.readBinary(path);
+		};
+
+		const saveConflictCopy = async (path: string, remote: ArrayBuffer) => {
+			const copyPath = conflictPath(path, (p) =>
+				Boolean(vault.getAbstractFileByPath(p)),
+			);
+			// Created through the vault so it is tracked and pushed.
+			await vault.createBinary(copyPath, remote);
+			t.settings.operations[path] = 'modify';
+			conflicts++;
+		};
+
 		await batchAsync(
 			files.map((file) => async () => {
 				const path = unSplitPath(file.properties);
@@ -267,22 +308,26 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 				);
 
 				const knownMd5 = t.settings.driveIdToMd5[file.id];
+				const remoteMd5 = file.md5Checksum;
 				t.settings.driveIdToPath[file.id] = path;
 				if (isPrivatePluginFile(t, path)) return;
 
-				const localFile = vault.getFileByPath(path);
 				const existsLocally =
-					Boolean(localFile) || (await adapter.exists(path));
+					Boolean(vault.getFileByPath(path)) ||
+					(await adapter.exists(path));
 				const operation = t.settings.operations[path];
 
 				if (
-					file.md5Checksum &&
-					knownMd5 === file.md5Checksum &&
+					remoteMd5 &&
+					knownMd5 === remoteMd5 &&
 					(existsLocally || operation === 'delete')
 				) {
 					// Our own upload or a metadata-only change.
 					return;
 				}
+
+				// MD5 of the local copy we are about to replace, if any.
+				let expectedLocalMd5: string | undefined;
 
 				if (operation === 'delete' && !isConfig(path)) {
 					// Local delete vs remote edit: the remote edit wins.
@@ -291,46 +336,52 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 					existsLocally &&
 					(operation === 'create' || operation === 'modify')
 				) {
-					const localBytes = localFile
-						? await vault.readBinary(localFile)
-						: await adapter.readBinary(path);
-					if (file.md5Checksum && md5(localBytes) === file.md5Checksum) {
-						t.settings.driveIdToMd5[file.id] = file.md5Checksum;
+					const localMd5 = md5(await readLocal(path));
+					if (remoteMd5 && localMd5 === remoteMd5) {
+						t.settings.driveIdToMd5[file.id] = remoteMd5;
 						delete t.settings.operations[path];
 						return;
 					}
-					if (isConfig(path)) {
-						// Settings: local wins, it is pushed next.
-						t.settings.operations[path] = 'modify';
-						if (file.md5Checksum) {
-							t.settings.driveIdToMd5[file.id] = file.md5Checksum;
+					const editedLocally = !knownMd5 || localMd5 !== knownMd5;
+					if (editedLocally) {
+						if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
+						if (isConfig(path)) {
+							// Settings: local wins, it is pushed next.
+							t.settings.operations[path] = 'modify';
+							return;
 						}
+						const remote = await t.drive.getFile(file.id).arrayBuffer();
+						await saveConflictCopy(path, remote);
 						return;
 					}
-					const remote = await t.drive.getFile(file.id).arrayBuffer();
-					const copyPath = conflictPath(
-						path,
-						(p) => Boolean(vault.getAbstractFileByPath(p)),
-					);
-					// Created through the vault so it is tracked and pushed.
-					await vault.createBinary(copyPath, remote);
-					t.settings.operations[path] = 'modify';
-					if (file.md5Checksum) {
-						t.settings.driveIdToMd5[file.id] = file.md5Checksum;
-					}
-					conflicts++;
+					// The op was stale: the bytes still match the last sync.
+					delete t.settings.operations[path];
+					expectedLocalMd5 = localMd5;
+				} else if (existsLocally) {
+					expectedLocalMd5 = md5(await readLocal(path));
+				}
+
+				await reviveAncestors(path);
+				const content = await t.drive.getFile(file.id).arrayBuffer();
+
+				// The user may have typed while we were downloading.
+				if (
+					expectedLocalMd5 &&
+					!isConfig(path) &&
+					md5(await readLocal(path)) !== expectedLocalMd5
+				) {
+					if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
+					await saveConflictCopy(path, content);
 					return;
 				}
 
-				const content = await t.drive.getFile(file.id).arrayBuffer();
+				const localFile = vault.getFileByPath(path);
 				if (localFile instanceof TFile) {
 					await t.modifyFile(localFile, content, file.modifiedTime);
 				} else {
 					await t.upsertFile(path, content, file.modifiedTime);
 				}
-				if (file.md5Checksum) {
-					t.settings.driveIdToMd5[file.id] = file.md5Checksum;
-				}
+				if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
 			}),
 		);
 

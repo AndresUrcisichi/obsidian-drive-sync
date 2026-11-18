@@ -166,6 +166,16 @@ export default class ObsidianGoogleDrive extends Plugin {
 		void this.saveSettings();
 	}
 
+	/** Forget everything tied to one Google account or OAuth client. */
+	async resetSyncState() {
+		this.settings.driveIdToPath = {};
+		this.settings.driveIdToMd5 = {};
+		this.settings.changesToken = '';
+		this.settings.rootFolderId = '';
+		this.accessToken = { token: '', expiresAt: 0 };
+		await this.saveSettings();
+	}
+
 	requireSignIn() {
 		if (isSignedIn(this)) return true;
 		new Notice('Sign in to Google Drive in the plugin settings first.');
@@ -351,6 +361,9 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	async startSync() {
+		// Checked and set without awaiting in between, so two syncs can
+		// never both get past this point.
+		if (this.syncing) throw new Error('A sync is already running');
 		if (!navigator.onLine) {
 			new Notice(
 				'You are offline. Sync will work again once you are connected.',
@@ -431,6 +444,7 @@ class SettingsTab extends PluginSettingTab {
 						signedIn
 							? button.setButtonText('Sign out').onClick(async () => {
 									await signOut(plugin);
+									await plugin.resetSyncState();
 									this.update();
 								})
 							: button
@@ -565,7 +579,14 @@ class SettingsTab extends PluginSettingTab {
 
 	async setControlValue(key: string, value: unknown) {
 		if (key === 'autoPushDelaySeconds') value = Number(value);
+		const previous = (this.plugin.settings as unknown as Record<string, unknown>)[key];
 		await super.setControlValue(key, value);
+		if (key === 'clientId' && previous !== value) {
+			// Tokens and file IDs belong to the old client.
+			await signOut(this.plugin);
+			await this.plugin.resetSyncState();
+			this.update();
+		}
 		if (key === 'autoPush') {
 			if (value) this.plugin.resumeAutoPushIfNeeded();
 			else this.plugin.clearAutoPushTimer();

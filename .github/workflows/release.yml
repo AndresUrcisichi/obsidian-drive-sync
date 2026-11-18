@@ -23,11 +23,10 @@ jobs:
 
             - name: Test and build
               env:
-                  # Optional: bake OAuth defaults into the release so devices
-                  # installing through BRAT only need "Sign in with Google".
+                  # Public values only. The client secret is never baked into a
+                  # public release; each device stores it in secret storage.
                   GDVS_CLIENT_ID: ${{ vars.GDVS_CLIENT_ID }}
                   GDVS_REDIRECT_URI: ${{ vars.GDVS_REDIRECT_URI }}
-                  GDVS_CLIENT_SECRET: ${{ secrets.GDVS_CLIENT_SECRET }}
               run: |
                   npm ci
                   npm test

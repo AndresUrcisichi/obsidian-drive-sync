@@ -261,13 +261,19 @@ export const push = async (
 	const { vault } = t.app;
 	const adapter = vault.adapter;
 
+	// No auto-push may start while the confirmation is open.
+	t.clearAutoPushTimer();
 	const proceed =
 		skipConfirmation ||
 		(await new Promise<boolean>((resolve) => {
 			new ConfirmPushModal(t, initialOperations, resolve).open();
 		}));
 
-	if (!proceed) return;
+	// Something else may have started syncing while the modal was open.
+	if (!proceed || t.syncing) {
+		if (!t.syncing) t.resumeAutoPushIfNeeded();
+		return;
+	}
 
 	const syncNotice = await t.startSync();
 	try {
@@ -286,19 +292,20 @@ export const push = async (
 
 		const operations = Object.entries(t.settings.operations);
 		const deletes = operations.filter(([_, op]) => op === 'delete');
-		// A "create" for a path Drive already has is an update.
-		const creates = operations.filter(
-			([path, op]) => op === 'create' && !pathsToIds[path],
+		// Whether a write is a create or an update depends only on whether
+		// Drive already has the path, not on which local event recorded it.
+		const writes = operations.filter(
+			([_, op]) => op === 'create' || op === 'modify',
 		);
-		const modifies = operations.filter(
-			([path, op]) =>
-				op === 'modify' || (op === 'create' && pathsToIds[path]),
-		);
+		const creates = writes.filter(([path]) => !pathsToIds[path]);
+		const modifies = writes.filter(([path]) => pathsToIds[path]);
 
-		const configOnDrive = await t.drive.searchFiles({
-			include: ['properties'],
-			matches: [{ properties: { config: 'true' } }],
-		});
+		const configOnDrive = t.settings.syncConfig
+			? await t.drive.searchFiles({
+					include: ['properties'],
+					matches: [{ properties: { config: 'true' } }],
+				})
+			: [];
 		if (!configOnDrive) {
 			new Notice('An error occurred fetching Google Drive files.');
 			return;
@@ -375,6 +382,7 @@ export const push = async (
 			}
 		};
 
+		const deferredPaths: string[] = [];
 		let completed = 0;
 		const total = creates.length + modifies.length;
 		const progress = () =>
@@ -427,9 +435,34 @@ export const push = async (
 		}
 
 		if (modifies.length) {
+			// Files another device changed since our pull are left for the
+			// next pull, which keeps both versions instead of overwriting.
+			const sincePull = await t.drive.getChanges(t.settings.changesToken);
+			if (!sincePull) {
+				new Notice('An error occurred fetching Google Drive changes.');
+				return;
+			}
+			const changedRemotely = new Set(
+				sincePull.changes
+					.filter(
+						({ fileId, file }) =>
+							file?.md5Checksum &&
+							file.md5Checksum !== t.settings.driveIdToMd5[fileId],
+					)
+					.map(({ fileId }) => fileId),
+			);
+
 			const files = modifies
+				.filter(([path]) => !changedRemotely.has(pathsToIds[path] as string))
 				.map(([path]) => vault.getFileByPath(path))
 				.filter((file): file is TFile => file instanceof TFile);
+			deferredPaths.push(
+				...modifies
+					.filter(([path]) =>
+						changedRemotely.has(pathsToIds[path] as string),
+					)
+					.map(([path]) => path),
+			);
 
 			await batchAsync(
 				files.map((file) => async () => {
@@ -501,9 +534,9 @@ export const push = async (
 			}),
 		);
 
-		// Keep only edits made while this push was running.
+		// Keep edits made while this push was running, and deferred updates.
 		t.settings.operations = Object.fromEntries(
-			[...t.touchedDuringSync]
+			[...t.touchedDuringSync, ...deferredPaths]
 				.map((path) => [path, t.settings.operations[path]] as const)
 				.filter(([, op]) => op),
 		) as typeof t.settings.operations;

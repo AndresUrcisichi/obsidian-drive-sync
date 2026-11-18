@@ -1,5 +1,6 @@
 import type ObsidianGoogleDrive from '../main';
 import { getDriveAgent } from './requests';
+import { BUILD_DEFAULTS } from './auth';
 import { TAbstractFile, TFolder } from 'obsidian';
 
 export interface FileMetadata {
@@ -268,6 +269,45 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		return id;
 	};
 
+	// Creates use IDs reserved up front, so a retried request that already
+	// succeeded on Google's side cannot produce a duplicate file.
+	let reservedIds: string[] = [];
+	let reserving: Promise<void> | undefined;
+	const reserveId = async (): Promise<string> => {
+		while (!reservedIds.length) {
+			reserving ??= drive
+				.get('drive/v3/files/generateIds?count=100&space=drive&type=files')
+				.json<{ ids: string[] }>()
+				.then(({ ids }) => {
+					reservedIds.push(...ids);
+				})
+				.finally(() => {
+					reserving = undefined;
+				});
+			await reserving;
+		}
+		return reservedIds.pop() as string;
+	};
+
+	/** Runs a create; if it errors, checks whether the ID landed anyway. */
+	const createIdempotent = async (
+		id: string,
+		create: () => Promise<UploadResult | undefined>,
+	) => {
+		try {
+			return await create();
+		} catch (error) {
+			const existing = await drive
+				.get(`drive/v3/files/${id}?fields=id,md5Checksum,trashed`)
+				.json<UploadResult & { trashed?: boolean }>()
+				.catch(() => undefined);
+			if (existing?.id === id && !existing.trashed) {
+				return { id, md5Checksum: existing.md5Checksum };
+			}
+			throw error;
+		}
+	};
+
 	const createFolder = async ({
 		name,
 		parent,
@@ -289,20 +329,23 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		if (!properties) properties = {};
 		if (!properties.vault) properties.vault = t.app.vault.getName();
 
-		const folder = await drive
-			.post(`drive/v3/files`, {
-				json: {
-					name,
-					mimeType: folderMimeType,
-					description,
-					parents: [parent],
-					properties,
-					modifiedTime,
-				},
-			})
-			.json<{ id: string }>();
-		if (!folder) return;
-		return folder.id;
+		const id = await reserveId();
+		const folder = await createIdempotent(id, () =>
+			drive
+				.post(`drive/v3/files?fields=id`, {
+					json: {
+						id,
+						name,
+						mimeType: folderMimeType,
+						description,
+						parents: [parent],
+						properties,
+						modifiedTime,
+					},
+				})
+				.json<UploadResult>(),
+		);
+		return folder?.id;
 	};
 
 	const uploadFile = async (
@@ -322,12 +365,14 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			metadata.properties.vault = t.app.vault.getName();
 		}
 
+		const id = await reserveId();
 		const form = new FormData();
 		form.append(
 			'metadata',
 			new Blob(
 				[
 					JSON.stringify({
+						id,
 						name,
 						mimeType: file.type,
 						parents: [parent],
@@ -339,12 +384,14 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		);
 		form.append('file', file);
 
-		const result = await drive
-			.post(
-				`upload/drive/v3/files?uploadType=multipart&fields=id,md5Checksum`,
-				{ body: form },
-			)
-			.json<UploadResult>();
+		const result = await createIdempotent(id, () =>
+			drive
+				.post(
+					`upload/drive/v3/files?uploadType=multipart&fields=id,md5Checksum`,
+					{ body: form },
+				)
+				.json<UploadResult>(),
+		);
 		if (!result?.id) return;
 
 		return result;
@@ -421,6 +468,10 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		}));
 	};
 
+	/**
+	 * Moves files to the Drive trash (recoverable for 30 days) in batches of
+	 * 100. Other devices see them as removed through the changes feed.
+	 */
 	const batchDelete = async (ids: string[]) => {
 		if (!ids.length) return true;
 
@@ -435,8 +486,10 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 							'Content-Type: application/http',
 							`Content-ID: <request_${offset + index + 1}>`,
 							'',
-							`DELETE /drive/v3/files/${fileId} HTTP/1.1`,
+							`PATCH /drive/v3/files/${fileId}?fields=id HTTP/1.1`,
+							'Content-Type: application/json',
 							'',
+							'{"trashed":true}',
 						].join('\r\n'),
 					)
 					.concat(`--${boundary}--`)
@@ -626,8 +679,12 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
  * This plugin's own data.json holds per-device sync state and must never be
  * uploaded: every device keeps its own operation log and Drive ID map.
  */
-export const isPrivatePluginFile = (t: ObsidianGoogleDrive, path: string) =>
-	path === `${t.app.vault.configDir}/plugins/${t.manifest.id}/data.json`;
+export const isPrivatePluginFile = (t: ObsidianGoogleDrive, path: string) => {
+	const dir = `${t.app.vault.configDir}/plugins/${t.manifest.id}/`;
+	if (path === dir + 'data.json') return true;
+	// A local build with a baked-in client secret stays on this device.
+	return path === dir + 'main.js' && Boolean(BUILD_DEFAULTS.clientSecret);
+};
 
 /**
  * Runs tasks with a fixed number of workers. Unlike fixed-size batches, a slow
@@ -639,15 +696,23 @@ export const batchAsync = async <T = unknown>(
 ) => {
 	const results = new Array<T>(requests.length);
 	let next = 0;
+	let failure: { error: unknown } | undefined;
 	const worker = async () => {
-		while (next < requests.length) {
+		while (!failure && next < requests.length) {
 			const index = next++;
-			results[index] = await (requests[index] as () => Promise<T>)();
+			try {
+				results[index] = await (requests[index] as () => Promise<T>)();
+			} catch (error) {
+				failure ??= { error };
+			}
 		}
 	};
+	// No new task starts after a failure, and none is left running when this
+	// returns, so callers never race with stray workers.
 	await Promise.all(
 		Array.from({ length: Math.min(concurrency, requests.length) }, worker),
 	);
+	if (failure) throw failure.error;
 	return results;
 };
 
