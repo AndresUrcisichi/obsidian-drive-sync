@@ -15,6 +15,7 @@ vi.mock('obsidian', () => ({
 		}
 	},
 	requestUrl: mocks.requestUrl,
+	Platform: { isDesktopApp: false },
 }));
 
 import {

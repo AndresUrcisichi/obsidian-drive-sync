@@ -1,5 +1,5 @@
 import type ObsidianGoogleDrive from '../main';
-import { Notice, requestUrl } from 'obsidian';
+import { Notice, Platform, requestUrl } from 'obsidian';
 
 // Only files this OAuth client creates are visible to the plugin. Google
 // classifies this scope as non-sensitive, so a personal Cloud project can be
@@ -121,7 +121,27 @@ export const startSignIn = async (t: ObsidianGoogleDrive) => {
 		state,
 	}).toString();
 
-	window.open(url.toString());
+	openInSystemBrowser(url.toString());
+};
+
+/**
+ * On desktop, window.open can land in Obsidian's built-in web viewer, where
+ * the obsidian:// redirect back never fires. Use the system browser instead.
+ */
+const openInSystemBrowser = (url: string) => {
+	if (Platform.isDesktopApp) {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- electron is only reachable through require at runtime, and only on desktop
+			const { shell } = require('electron') as {
+				shell: { openExternal: (url: string) => Promise<void> };
+			};
+			void shell.openExternal(url);
+			return;
+		} catch {
+			// Fall through to window.open.
+		}
+	}
+	window.open(url);
 };
 
 const takePending = (t: ObsidianGoogleDrive): PendingAuth | undefined => {
