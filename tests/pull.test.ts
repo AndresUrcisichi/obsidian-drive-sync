@@ -227,6 +227,29 @@ describe('pull (incremental)', () => {
 		expect(notices.some((n) => n.includes('conflict'))).toBe(true);
 	});
 
+	it('keeps the remote edit pending when the conflict download fails', async () => {
+		const { plugin } = createPlugin({ 'a.md': 'mine' });
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('base') };
+		plugin.settings.operations = { 'a.md': 'modify' };
+		plugin.drive.getFile.mockImplementationOnce(() => ({
+			arrayBuffer: () => Promise.reject(new Error('offline')),
+		}));
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{ fileId: 'a-id', removed: false, file: remote('a-id', 'a.md', 'theirs') },
+			],
+			newStartPageToken: 'next-token',
+		});
+		vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+		await expect(pull(plugin as never, true)).resolves.toBe(false);
+
+		// Still unknown, so the next pull retries the conflict copy.
+		expect(plugin.settings.driveIdToMd5['a-id']).toBe(md5('base'));
+		expect(plugin.settings.changesToken).toBe('changes');
+	});
+
 	it('takes the remote version when a pending op is stale', async () => {
 		const { plugin, files, remoteContents } = createPlugin({ 'a.md': 'base' });
 		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };

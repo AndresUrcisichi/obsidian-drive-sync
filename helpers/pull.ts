@@ -344,14 +344,18 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 					}
 					const editedLocally = !knownMd5 || localMd5 !== knownMd5;
 					if (editedLocally) {
-						if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
-						if (isConfig(path)) {
+						if (!isConfig(path)) {
+							const remote = await t.drive
+								.getFile(file.id)
+								.arrayBuffer();
+							await saveConflictCopy(path, remote);
+						} else {
 							// Settings: local wins, it is pushed next.
 							t.settings.operations[path] = 'modify';
-							return;
 						}
-						const remote = await t.drive.getFile(file.id).arrayBuffer();
-						await saveConflictCopy(path, remote);
+						// Only now is the remote version safe locally; marking it
+						// known earlier would hide it if the download failed.
+						if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
 						return;
 					}
 					// The op was stale: the bytes still match the last sync.
@@ -370,8 +374,8 @@ export const pull = async (t: ObsidianGoogleDrive, silenceNotices = false) => {
 					!isConfig(path) &&
 					md5(await readLocal(path)) !== expectedLocalMd5
 				) {
-					if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
 					await saveConflictCopy(path, content);
+					if (remoteMd5) t.settings.driveIdToMd5[file.id] = remoteMd5;
 					return;
 				}
 

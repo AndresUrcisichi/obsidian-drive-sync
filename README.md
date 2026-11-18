@@ -17,6 +17,8 @@ Es un fork de [RichardX366/Obsidian-Google-Drive](https://github.com/RichardX366
 | Errores 429/5xx | Falla la sincronización | Reintento con backoff exponencial y `Retry-After` |
 | Conflictos | Gana el local y el remoto se pierde | Se guarda el remoto como `nota (conflict AAAA-MM-DD HHMM).md` |
 | Equipo nuevo | El vault debía estar vacío | Adopta una copia local existente comparando MD5 |
+| Borrados en Drive | Permanentes | A la papelera de Drive (recuperables 30 días) |
+| Reintentos de subida | Podían duplicar archivos | IDs reservados con `generateIds`: un reintento nunca duplica |
 | Auto-push | Apagado, 60 s | Encendido, 30 s (configurable) |
 | Al volver a la app | Nada | Pull automático (útil en iPhone) |
 
@@ -44,9 +46,11 @@ npm run build          # genera main.js con esos valores integrados
 npm test
 ```
 
-Con `.env` cada equipo solo necesita pulsar **Sign in with Google**. Sin `.env`, introduce los tres valores en los ajustes del plugin. El client secret se guarda en el almacén de secretos de Obsidian, no en el vault.
+Con `.env`, el equipo donde compilas solo necesita pulsar **Sign in with Google**. Ese `main.js` lleva el secret dentro, así que el plugin nunca lo sube a Drive.
 
-> El client secret de una app instalada no es un secreto real; Google lo asume así. Con él solo se puede iniciar el login contra tu proyecto: no da acceso a tus archivos. Lo que protege tus datos es el refresh token, que no sale de cada equipo.
+Las releases públicas de GitHub (las que instala BRAT en el iPhone) **no** llevan el secret. Llevan solo el Client ID y la Redirect URI, si los defines como variables del repo (`GDVS_CLIENT_ID`, `GDVS_REDIRECT_URI`). En esos equipos pegas el client secret una vez en los ajustes, y queda en el almacén de secretos de Obsidian.
+
+> Con el client secret solo se puede iniciar el login contra tu proyecto de Google Cloud: no da acceso a tus archivos. Lo que protege tus datos es el refresh token, que no sale de cada equipo.
 
 ## Instalar
 
@@ -56,7 +60,7 @@ Con `.env` cada equipo solo necesita pulsar **Sign in with Google**. Sin `.env`,
 1. Instala **BRAT** desde los plugins de la comunidad.
 2. **BRAT → Add beta plugin**: `AndresUrcisichi/obsidian-drive-sync`.
 3. Crea el vault en **En mi iPhone**, nunca en iCloud, porque los dos sincronizadores se pelean. Usa el mismo nombre de vault que en el escritorio.
-4. Abre los ajustes del plugin y pulsa **Sign in with Google**. Safari te devuelve a Obsidian.
+4. En los ajustes del plugin, pega el **Client secret** (por ejemplo desde tu gestor de contraseñas) y pulsa **Sign in with Google**. Safari te devuelve a Obsidian.
 
 A partir de ahí, las actualizaciones del plugin hechas en el escritorio llegan al iPhone con la sincronización de configuración.
 
@@ -81,3 +85,5 @@ A partir de ahí, las actualizaciones del plugin hechas en el escritorio llegan 
 - No edites el vault con Obsidian cerrado usando otras apps. El plugin detecta los cambios a través de Obsidian.
 - No renombres un vault que ya sincroniza: el nombre del vault es la clave en Drive.
 - Un iPhone solo sincroniza con Obsidian abierto. iOS no permite sincronizar en segundo plano.
+- Los archivos borrados van a la papelera de Drive y ocupan espacio 30 días.
+- Si cierras sesión y vuelves a entrar con la misma cuenta, se conserva el índice. Con otra cuenta u otro cliente OAuth, se rehace desde cero sin perder tus cambios pendientes.

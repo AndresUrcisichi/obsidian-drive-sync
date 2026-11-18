@@ -672,6 +672,16 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		batchDelete,
 		deleteFilesMinimumOperations,
 		getConfigFilesToSync,
+		/** Stable per-account ID; works with the drive.file scope. */
+		getAccountId: async () =>
+			(
+				await drive
+					.get('drive/v3/about?fields=user(permissionId)')
+					.json<{ user: { permissionId: string } }>()
+			).user.permissionId,
+		clearReservedIds: () => {
+			reservedIds = [];
+		},
 	};
 };
 

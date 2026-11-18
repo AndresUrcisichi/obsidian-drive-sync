@@ -2,6 +2,7 @@ import { getDriveClient } from './helpers/drive';
 import {
 	BUILD_DEFAULTS,
 	finishSignIn,
+	getClientId,
 	getClientSecret,
 	isSignedIn,
 	parsePastedCode,
@@ -39,6 +40,9 @@ interface PluginSettings {
 	driveIdToMd5: Record<string, string>;
 	rootFolderId: string;
 	lastSyncedAt: number;
+	/** Drive permissionId and OAuth client the sync state belongs to. */
+	accountId: string;
+	signedInClientId: string;
 	changesToken: string;
 }
 
@@ -55,6 +59,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	rootFolderId: '',
 	lastSyncedAt: 0,
 	changesToken: '',
+	accountId: '',
+	signedInClientId: '',
 };
 
 // Fields from the upstream plugin that must not linger in data.json.
@@ -166,8 +172,12 @@ export default class ObsidianGoogleDrive extends Plugin {
 		void this.saveSettings();
 	}
 
-	/** Forget everything tied to one Google account or OAuth client. */
+	/**
+	 * Forget everything tied to one Google account or OAuth client. Pending
+	 * local operations are kept so unpushed edits still upload.
+	 */
 	async resetSyncState() {
+		this.drive.clearReservedIds();
 		this.settings.driveIdToPath = {};
 		this.settings.driveIdToMd5 = {};
 		this.settings.changesToken = '';
@@ -183,8 +193,28 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	async completeSignIn(code: string, state: string) {
+		if (this.syncing) {
+			new Notice('A sync is running. Try again when it finishes.');
+			return;
+		}
 		if (!(await finishSignIn(this, code, state))) return;
-		new Notice('Signed in to Google Drive. Starting the first sync…');
+
+		// Same account and client: keep the index, nothing to re-download.
+		// Anything else: the old file IDs mean nothing, start over.
+		const accountId = await this.drive.getAccountId().catch(() => '');
+		const clientId = getClientId(this);
+		if (
+			(this.settings.accountId && this.settings.accountId !== accountId) ||
+			(this.settings.signedInClientId &&
+				this.settings.signedInClientId !== clientId)
+		) {
+			await this.resetSyncState();
+		}
+		this.settings.accountId = accountId;
+		this.settings.signedInClientId = clientId;
+		await this.saveSettings();
+
+		new Notice('Signed in to Google Drive. Syncing…');
 		await this.backgroundPull();
 	}
 
@@ -443,8 +473,13 @@ class SettingsTab extends PluginSettingTab {
 					setting.addButton((button) =>
 						signedIn
 							? button.setButtonText('Sign out').onClick(async () => {
+									if (plugin.syncing) {
+										new Notice(
+											'A sync is running. Try again when it finishes.',
+										);
+										return;
+									}
 									await signOut(plugin);
-									await plugin.resetSyncState();
 									this.update();
 								})
 							: button
@@ -579,13 +614,15 @@ class SettingsTab extends PluginSettingTab {
 
 	async setControlValue(key: string, value: unknown) {
 		if (key === 'autoPushDelaySeconds') value = Number(value);
-		const previous = (this.plugin.settings as unknown as Record<string, unknown>)[key];
+		const previous = (
+			this.plugin.settings as unknown as Record<string, unknown>
+		)[key];
 		await super.setControlValue(key, value);
-		if (key === 'clientId' && previous !== value) {
-			// Tokens and file IDs belong to the old client.
-			await signOut(this.plugin);
-			await this.plugin.resetSyncState();
-			this.update();
+		if (key === 'syncConfig' && value && !previous) {
+			// Config changes skipped while this was off are behind the
+			// checkpoint; re-list Drive once to pick them up.
+			this.plugin.settings.changesToken = '';
+			await this.plugin.saveSettings();
 		}
 		if (key === 'autoPush') {
 			if (value) this.plugin.resumeAutoPushIfNeeded();

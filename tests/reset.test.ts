@@ -135,6 +135,8 @@ describe('reset', () => {
 				return true;
 			}),
 			abortSync: vi.fn(),
+			clearAutoPushTimer: vi.fn(),
+			resumeAutoPushIfNeeded: vi.fn(),
 			deleteFile: vi.fn(),
 			modifyFile: vi.fn(async () => undefined),
 			createFile: vi.fn(async () => undefined),

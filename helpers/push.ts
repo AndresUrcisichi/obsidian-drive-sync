@@ -261,7 +261,8 @@ export const push = async (
 	const { vault } = t.app;
 	const adapter = vault.adapter;
 
-	// No auto-push may start while the confirmation is open.
+	// Edits during the modal can re-arm the timer; the re-check below is
+	// what actually prevents overlapping syncs.
 	t.clearAutoPushTimer();
 	const proceed =
 		skipConfirmation ||
@@ -269,13 +270,25 @@ export const push = async (
 			new ConfirmPushModal(t, initialOperations, resolve).open();
 		}));
 
+	if (!proceed) {
+		t.resumeAutoPushIfNeeded();
+		return;
+	}
 	// Something else may have started syncing while the modal was open.
-	if (!proceed || t.syncing) {
-		if (!t.syncing) t.resumeAutoPushIfNeeded();
+	if (t.syncing) {
+		if (!skipConfirmation) {
+			new Notice('A sync is running. Try again when it finishes.');
+		}
 		return;
 	}
 
-	const syncNotice = await t.startSync();
+	let syncNotice: Notice;
+	try {
+		syncNotice = await t.startSync();
+	} catch {
+		t.resumeAutoPushIfNeeded();
+		return;
+	}
 	try {
 		if (!(await pull(t, true))) return;
 		if (!(await t.drive.getRootFolderId(true))) {

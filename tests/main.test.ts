@@ -27,6 +27,11 @@ vi.mock('obsidian', () => {
 	};
 });
 
+vi.mock('../helpers/auth', async (importOriginal) => ({
+	...(await importOriginal<typeof import('../helpers/auth')>()),
+	finishSignIn: vi.fn(async () => true),
+}));
+
 import { TFile } from 'obsidian';
 import ObsidianGoogleDrive from '../main';
 
@@ -169,5 +174,41 @@ describe('ObsidianGoogleDrive settings migration', () => {
 		expect(plugin.settings).not.toHaveProperty('clientSecret');
 		expect(plugin.settings.autoPush).toBe(false);
 		expect(plugin.saveSettings).toHaveBeenCalledOnce();
+	});
+});
+
+describe('ObsidianGoogleDrive account changes', () => {
+	const signInWith = async (accountId: string, stored: string) => {
+		const plugin = createPlugin();
+		plugin.syncing = false;
+		Object.assign(plugin.settings, {
+			accountId: stored,
+			signedInClientId: '',
+			driveIdToPath: { 'a-id': 'a.md' },
+			driveIdToMd5: { 'a-id': 'm' },
+			operations: { 'b.md': 'modify' },
+		});
+		Object.assign(plugin.drive, {
+			getAccountId: vi.fn(async () => accountId),
+			clearReservedIds: vi.fn(),
+		});
+		Object.assign(plugin, { backgroundPull: vi.fn(async () => undefined) });
+		await plugin.completeSignIn('code', 'state');
+		return plugin;
+	};
+
+	it('keeps the sync index when the same account signs back in', async () => {
+		const plugin = await signInWith('acct-1', 'acct-1');
+
+		expect(plugin.settings.driveIdToPath).toEqual({ 'a-id': 'a.md' });
+	});
+
+	it('starts over for a different account but keeps pending edits', async () => {
+		const plugin = await signInWith('acct-2', 'acct-1');
+
+		expect(plugin.settings.driveIdToPath).toEqual({});
+		expect(plugin.settings.changesToken).toBe('');
+		expect(plugin.settings.operations).toEqual({ 'b.md': 'modify' });
+		expect(plugin.settings.accountId).toBe('acct-2');
 	});
 });

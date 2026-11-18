@@ -45,12 +45,26 @@ export class ConfirmResetModal extends Modal {
 export const reset = async (t: ObsidianGoogleDrive) => {
 	if (t.syncing) return;
 
+	t.clearAutoPushTimer();
 	const proceed = await new Promise<boolean>((resolve) => {
 		new ConfirmResetModal(t, resolve).open();
 	});
-	if (!proceed) return;
+	if (!proceed) {
+		t.resumeAutoPushIfNeeded();
+		return;
+	}
+	if (t.syncing) {
+		new Notice('A sync is running. Try again when it finishes.');
+		return;
+	}
 
-	const syncNotice = await t.startSync();
+	let syncNotice: Notice;
+	try {
+		syncNotice = await t.startSync();
+	} catch {
+		t.resumeAutoPushIfNeeded();
+		return;
+	}
 	try {
 		if (!(await pull(t, true))) return;
 
