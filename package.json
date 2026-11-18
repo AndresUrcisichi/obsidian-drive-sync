@@ -1,6 +1,6 @@
 {
 	"name": "gdrive-vault-sync",
-	"version": "4.0.1",
+	"version": "4.0.2",
 	"description": "Sync an Obsidian vault through your own Google Drive, on desktop and iOS, with no third-party servers.",
 	"main": "main.js",
 	"type": "module",
@@ -17,7 +17,7 @@
 	"devDependencies": {
 		"@eslint/js": "^9.39.4",
 		"@types/node": "^22.15.17",
-		"esbuild": "0.25.5",
+		"esbuild": "^0.28.2",
 		"eslint": "^9.39.4",
 		"eslint-plugin-obsidianmd": "^0.4.0",
 		"globals": "^17.6.0",
