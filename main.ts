@@ -104,6 +104,12 @@ export default class ObsidianGoogleDrive extends Plugin {
 		);
 
 		this.addCommand({
+			id: 'sign-in',
+			name: 'Sign in with Google',
+			callback: () => void startSignIn(this),
+		});
+
+		this.addCommand({
 			id: 'push',
 			name: 'Push to Google Drive',
 			callback: () => this.requireSignIn() && push(this),
