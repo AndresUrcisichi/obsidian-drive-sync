@@ -29,203 +29,330 @@ vi.mock('obsidian', () => {
 	};
 });
 
-import { pull } from '../helpers/pull';
-import { TFile } from 'obsidian';
+import { conflictPath, pull } from '../helpers/pull';
+import { md5 } from '../helpers/md5';
+import { TFile, TFolder } from 'obsidian';
 
-const createPlugin = () => {
+const makeFile = (path: string) => Object.assign(new TFile(), { path });
+
+const bytes = (text: string) => new TextEncoder().encode(text).buffer;
+
+const remote = (
+	id: string,
+	path: string,
+	content?: string,
+	extra: Record<string, string> = {},
+) => ({
+	id,
+	mimeType:
+		content === undefined
+			? 'application/vnd.google-apps.folder'
+			: 'text/markdown',
+	md5Checksum: content === undefined ? undefined : md5(content),
+	modifiedTime: '2026-11-01T00:00:00.000Z',
+	properties: { path, vault: 'Vault', ...extra },
+});
+
+const createPlugin = (local: Record<string, string> = {}) => {
+	const files = new Map<string, TFile | TFolder>(
+		Object.keys(local).map((path) => [path, makeFile(path)]),
+	);
+	const contents = new Map(Object.entries(local));
+	const remoteContents = new Map<string, string>();
+
 	const adapter = {
-		exists: vi.fn(async () => false),
+		exists: vi.fn(async (path: string) => files.has(path)),
 		stat: vi.fn(
 			async (
 				_path: string,
 			): Promise<{ type: 'file' | 'folder' } | undefined> =>
 				undefined,
 		),
-		trashLocal: vi.fn(async () => true),
-		trashSystem: vi.fn(async () => true),
 		remove: vi.fn(async () => undefined),
 		list: vi.fn(async () => ({ files: [], folders: [] })),
 		rmdir: vi.fn(async () => undefined),
+		readBinary: vi.fn(async (path: string) =>
+			bytes(contents.get(path) ?? ''),
+		),
 	};
 	const vault = {
 		adapter,
 		configDir: 'config',
-		getAllLoadedFiles: vi.fn((): { path: string }[] => []),
-		getAbstractFileByPath: vi.fn(
-			(_path: string): TFile | null => null,
+		getName: () => 'Vault',
+		getAllLoadedFiles: vi.fn(() => [...files.values()]),
+		getAbstractFileByPath: vi.fn((path: string) => files.get(path) ?? null),
+		getFileByPath: vi.fn((path: string) => {
+			const file = files.get(path);
+			return file instanceof TFile ? file : null;
+		}),
+		getFolderByPath: vi.fn(() => null),
+		readBinary: vi.fn(async (file: TFile) =>
+			bytes(contents.get(file.path) ?? ''),
 		),
-		getFileByPath: vi.fn((_path: string) => null),
-		getFolderByPath: vi.fn((_path: string) => null),
-		getConfig: vi.fn(() => 'local'),
+		createBinary: vi.fn(async (path: string, data: ArrayBuffer) => {
+			files.set(path, makeFile(path));
+			contents.set(path, new TextDecoder().decode(data));
+		}),
 	};
-	return {
-		accessToken: { token: 'access', expiresAt: Date.now() + 3_600_000 },
+	const plugin = {
 		app: { vault },
+		manifest: { id: 'gdrive-vault-sync' },
+		lastPullAt: 0,
 		settings: {
 			lastSyncedAt: 0,
 			changesToken: 'changes',
+			syncConfig: true,
 			driveIdToPath: {} as Record<string, string>,
+			driveIdToMd5: {} as Record<string, string>,
 			operations: {} as Record<string, 'create' | 'delete' | 'modify'>,
 		},
 		drive: {
 			searchFiles: vi.fn(
 				async (): Promise<unknown[] | undefined> => [],
 			),
+			getChangesStartToken: vi.fn(async () => 'start-token'),
 			getChanges: vi.fn(
-				async (): Promise<{ removed: boolean; fileId: string }[]> => [],
+				async (): Promise<
+					| { changes: unknown[]; newStartPageToken: string }
+					| undefined
+				> => ({ changes: [], newStartPageToken: 'next-token' }),
 			),
 			deleteFilesMinimumOperations: vi.fn(async () => undefined),
-			getFile: vi.fn(),
+			getFile: vi.fn((id: string) => ({
+				arrayBuffer: async () => bytes(remoteContents.get(id) ?? ''),
+			})),
 		},
 		abortSync: vi.fn(),
 		endSync: vi.fn(async () => true),
-		createFolder: vi.fn(),
-		modifyFile: vi.fn(),
-		upsertFile: vi.fn(),
+		createFolder: vi.fn(async () => undefined),
+		modifyFile: vi.fn(async () => undefined),
+		upsertFile: vi.fn(async () => undefined),
 	};
+	return { plugin, files, contents, remoteContents };
 };
 
-describe('pull', () => {
+describe('pull (incremental)', () => {
 	beforeEach(() => {
 		notices.length = 0;
 	});
 
-	it('finishes a silent no-change pull without advancing the checkpoint itself', async () => {
-		const plugin = createPlugin();
+	it('advances the checkpoint to the token returned by the feed', async () => {
+		const { plugin } = createPlugin();
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
 
 		await expect(pull(plugin as never, true)).resolves.toBe(true);
 
+		expect(plugin.settings.changesToken).toBe('next-token');
+		expect(plugin.drive.searchFiles).not.toHaveBeenCalled();
 		expect(plugin.endSync).not.toHaveBeenCalled();
-		expect(plugin.abortSync).not.toHaveBeenCalled();
 	});
 
-	it('aborts when Drive files cannot be listed', async () => {
-		const plugin = createPlugin();
-		plugin.drive.searchFiles.mockResolvedValueOnce(undefined);
+	it('aborts and keeps the checkpoint when the feed fails', async () => {
+		const { plugin } = createPlugin();
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
+		plugin.drive.getChanges.mockResolvedValueOnce(undefined);
 
 		await expect(pull(plugin as never, true)).resolves.toBe(false);
 
+		expect(plugin.settings.changesToken).toBe('changes');
 		expect(plugin.abortSync).toHaveBeenCalledOnce();
 	});
 
-	it('reconciles creates, deletes, and renames made while Obsidian was closed', async () => {
-		const plugin = createPlugin();
+	it('skips downloads whose MD5 matches what this device already has', async () => {
+		const { plugin } = createPlugin({ 'a.md': 'same' });
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('same') };
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{ fileId: 'a-id', removed: false, file: remote('a-id', 'a.md', 'same') },
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.drive.getFile).not.toHaveBeenCalled();
+		expect(plugin.modifyFile).not.toHaveBeenCalled();
+	});
+
+	it('downloads remote edits and records their MD5', async () => {
+		const { plugin, files, remoteContents } = createPlugin({ 'a.md': 'old' });
+		plugin.settings.driveIdToPath = { 'a-id': 'a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('old') };
+		remoteContents.set('a-id', 'new');
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{ fileId: 'a-id', removed: false, file: remote('a-id', 'a.md', 'new') },
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.modifyFile).toHaveBeenCalledWith(
+			files.get('a.md'),
+			expect.any(ArrayBuffer),
+			'2026-11-01T00:00:00.000Z',
+		);
+		expect(plugin.settings.driveIdToMd5['a-id']).toBe(md5('new'));
+	});
+
+	it('keeps both versions when a note changed locally and on Drive', async () => {
+		const { plugin, contents, remoteContents } = createPlugin({
+			'notes/a.md': 'mine',
+		});
+		plugin.settings.driveIdToPath = { 'a-id': 'notes/a.md' };
+		plugin.settings.driveIdToMd5 = { 'a-id': md5('base') };
+		plugin.settings.operations = { 'notes/a.md': 'modify' };
+		remoteContents.set('a-id', 'theirs');
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{
+					fileId: 'a-id',
+					removed: false,
+					file: remote('a-id', 'notes/a.md', 'theirs'),
+				},
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		const copy = [...contents.keys()].find((p) => p.includes('(conflict'));
+		expect(copy).toMatch(/^notes\/a \(conflict \d{4}-\d{2}-\d{2} \d{4}\)\.md$/);
+		expect(contents.get(copy as string)).toBe('theirs');
+		expect(contents.get('notes/a.md')).toBe('mine');
+		expect(plugin.modifyFile).not.toHaveBeenCalled();
+		expect(plugin.settings.operations['notes/a.md']).toBe('modify');
+		expect(notices.some((n) => n.includes('conflict'))).toBe(true);
+	});
+
+	it('trashes remotely deleted files but keeps ones with local edits', async () => {
+		const { plugin, files } = createPlugin({
+			'gone.md': 'x',
+			'edited.md': 'y',
+		});
+		plugin.settings.driveIdToPath = {
+			'gone-id': 'gone.md',
+			'edited-id': 'edited.md',
+		};
+		plugin.settings.operations = { 'edited.md': 'modify' };
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{ fileId: 'gone-id', removed: true },
+				{ fileId: 'edited-id', removed: true },
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.drive.deleteFilesMinimumOperations).toHaveBeenCalledWith([
+			files.get('gone.md'),
+		]);
+		expect(plugin.settings.operations['edited.md']).toBe('create');
+		expect(plugin.settings.driveIdToPath).toEqual({});
+	});
+
+	it('ignores files from other vaults and never writes its own data.json', async () => {
+		const { plugin } = createPlugin();
+		plugin.settings.driveIdToPath = { 'x-id': 'x.md' };
+		plugin.drive.getChanges.mockResolvedValueOnce({
+			changes: [
+				{
+					fileId: 'other-id',
+					removed: false,
+					file: { ...remote('other-id', 'b.md', 'b'), properties: { path: 'b.md', vault: 'Other' } },
+				},
+				{
+					fileId: 'own-id',
+					removed: false,
+					file: remote(
+						'own-id',
+						'config/plugins/gdrive-vault-sync/data.json',
+						'{"secret":1}',
+						{ config: 'true' },
+					),
+				},
+			],
+			newStartPageToken: 'next-token',
+		});
+
+		await pull(plugin as never, true);
+
+		expect(plugin.drive.getFile).not.toHaveBeenCalled();
+		expect(plugin.upsertFile).not.toHaveBeenCalled();
+	});
+
+	it('reconciles creates and deletes made while Obsidian was closed', async () => {
+		const { plugin } = createPlugin({ 'new.md': 'n', 'stable.md': 's' });
 		plugin.settings.driveIdToPath = {
 			'old-id': 'old.md',
 			'stable-id': 'stable.md',
 		};
-		plugin.app.vault.getAllLoadedFiles.mockReturnValue([
-			{ path: '/' },
-			{ path: 'renamed.md' },
-			{ path: 'stable.md' },
-		]);
 
-		await expect(pull(plugin as never, true)).resolves.toBe(true);
+		await pull(plugin as never, true);
 
 		expect(plugin.settings.operations).toEqual({
 			'old.md': 'delete',
-			'renamed.md': 'create',
+			'new.md': 'create',
 		});
 	});
+});
 
-	it('cleans stale operations while preserving config operations', async () => {
-		const plugin = createPlugin();
-		plugin.settings.driveIdToPath = {
-			'stable-id': 'stable.md',
-			'missing-id': 'missing.md',
-		};
-		plugin.settings.operations = {
-			'ghost.md': 'create',
-			'stable.md': 'delete',
-			'missing.md': 'modify',
-			'config/plugins/example/data.json': 'modify',
-		};
-		plugin.app.vault.getAllLoadedFiles.mockReturnValue([
-			{ path: '/' },
-			{ path: 'stable.md' },
-		]);
-
-		await expect(pull(plugin as never, true)).resolves.toBe(true);
-
-		expect(plugin.settings.operations).toEqual({
-			'stable.md': 'modify',
-			'missing.md': 'delete',
-			'config/plugins/example/data.json': 'modify',
-		});
-	});
-
-	it('uses the preserved ID mapping to trash a remotely deleted config file', async () => {
-		const plugin = createPlugin();
-		const path = 'config/plugins/example/data.json';
-		plugin.settings.driveIdToPath['drive-id'] = path;
-		plugin.drive.getChanges.mockResolvedValueOnce([
-			{ removed: true, fileId: 'drive-id' },
-		]);
-		plugin.app.vault.adapter.stat.mockResolvedValueOnce({ type: 'file' });
-
-		await expect(pull(plugin as never, true)).resolves.toBe(true);
-
-		expect(plugin.app.vault.adapter.trashLocal).toHaveBeenCalledWith(path);
-		expect(plugin.settings.driveIdToPath).not.toHaveProperty('drive-id');
-	});
-
-	it('pulls folders and files while applying regular and config deletions', async () => {
-		const plugin = createPlugin();
-		const deletedFile = new TFile();
-		Object.assign(deletedFile, { path: 'deleted.md' });
-		const configPath = 'config/plugins/example/data.json';
-		plugin.settings.driveIdToPath = {
-			'deleted-id': deletedFile.path,
-			'config-id': configPath,
-		};
-		plugin.app.vault.getAbstractFileByPath.mockImplementation(
-			(path: string) => (path === deletedFile.path ? deletedFile : null),
-		);
-		plugin.app.vault.getAllLoadedFiles.mockReturnValue([
-			{ path: deletedFile.path },
-		]);
-		plugin.app.vault.adapter.stat.mockImplementation(async (path: string) =>
-			path === configPath ? { type: 'file' as const } : undefined,
-		);
+describe('pull (first run on a device)', () => {
+	it('adopts an existing local copy by MD5 without downloading it', async () => {
+		const { plugin } = createPlugin({ 'a.md': 'same', 'local-only.md': 'l' });
+		plugin.settings.changesToken = '';
 		plugin.drive.searchFiles.mockResolvedValueOnce([
-			{
-				id: 'folder-id',
-				mimeType: 'application/vnd.google-apps.folder',
-				properties: { path: 'remote' },
-				modifiedTime: '2025-01-01T00:00:00.000Z',
-			},
-			{
-				id: 'note-id',
-				mimeType: 'text/markdown',
-				properties: { path: 'remote/note.md' },
-				modifiedTime: '2025-01-01T00:00:00.000Z',
-			},
+			remote('folder-id', 'folder'),
+			remote('a-id', 'a.md', 'same'),
 		]);
-		plugin.drive.getChanges.mockResolvedValueOnce([
-			{ removed: true, fileId: 'deleted-id' },
-			{ removed: true, fileId: 'config-id' },
-		]);
-		plugin.drive.getFile.mockReturnValue({
-			arrayBuffer: vi.fn(async () => new ArrayBuffer(4)),
-		});
 
-		await expect(pull(plugin as never, true)).resolves.toBe(true);
+		await pull(plugin as never, true);
 
-		expect(plugin.drive.deleteFilesMinimumOperations).toHaveBeenCalledWith([
-			deletedFile,
-		]);
-		expect(plugin.createFolder).toHaveBeenCalledWith('remote');
-		expect(plugin.upsertFile).toHaveBeenCalledWith(
-			'remote/note.md',
-			expect.any(ArrayBuffer),
-			'2025-01-01T00:00:00.000Z',
-		);
-		expect(plugin.app.vault.adapter.trashLocal).toHaveBeenCalledWith(
-			configPath,
-		);
+		expect(plugin.drive.getFile).not.toHaveBeenCalled();
 		expect(plugin.settings.driveIdToPath).toEqual({
-			'folder-id': 'remote',
-			'note-id': 'remote/note.md',
+			'folder-id': 'folder',
+			'a-id': 'a.md',
 		});
+		expect(plugin.settings.driveIdToMd5['a-id']).toBe(md5('same'));
+		expect(plugin.settings.operations).toEqual({ 'local-only.md': 'create' });
+		expect(plugin.settings.changesToken).toBe('start-token');
+		expect(plugin.createFolder).toHaveBeenCalledWith('folder');
+	});
+
+	it('downloads files the device does not have yet', async () => {
+		const { plugin, remoteContents } = createPlugin();
+		plugin.settings.changesToken = '';
+		remoteContents.set('a-id', 'hello');
+		plugin.drive.searchFiles.mockResolvedValueOnce([
+			remote('a-id', 'a.md', 'hello'),
+		]);
+
+		await pull(plugin as never, true);
+
+		expect(plugin.upsertFile).toHaveBeenCalledWith(
+			'a.md',
+			expect.any(ArrayBuffer),
+			'2026-11-01T00:00:00.000Z',
+		);
+	});
+});
+
+describe('conflictPath', () => {
+	it('adds a numeric suffix when the name is taken', () => {
+		const taken = new Set<string>();
+		const first = conflictPath('a/b.md', (p) => taken.has(p));
+		taken.add(first);
+		const second = conflictPath('a/b.md', (p) => taken.has(p));
+
+		expect(second).toBe(first.replace(').md', ' 2).md'));
+	});
+
+	it('handles files without an extension', () => {
+		expect(conflictPath('LICENSE', () => false)).toMatch(
+			/^LICENSE \(conflict .+\)$/,
+		);
 	});
 });

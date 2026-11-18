@@ -1,5 +1,6 @@
 import type ObsidianGoogleDrive from '../main';
-import { Notice, requestUrl, RequestUrlResponse } from 'obsidian';
+import { requestUrl, RequestUrlResponse } from 'obsidian';
+import { refreshAccessToken } from './auth';
 
 interface RequestOptions {
 	body?: BodyInit;
@@ -14,6 +15,49 @@ interface DriveResponse {
 	json<T>(): Promise<T>;
 	text(): Promise<string>;
 }
+
+export class DriveRequestError extends Error {
+	constructor(
+		readonly status: number,
+		readonly reason: string,
+	) {
+		super(`Google Drive request failed (HTTP ${status}${reason ? `: ${reason}` : ''})`);
+	}
+}
+
+const MAX_ATTEMPTS = 6;
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_REASONS = new Set([
+	'rateLimitExceeded',
+	'userRateLimitExceeded',
+	'backendError',
+]);
+
+export const sleep = (ms: number) =>
+	new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
+/** Exponential backoff with full jitter: 0.5s, 1s, 2s, 4s, 8s (capped 16s). */
+export const backoffDelay = (attempt: number, retryAfter?: string) => {
+	const seconds = Number(retryAfter);
+	if (retryAfter && Number.isFinite(seconds) && seconds >= 0) {
+		return Math.min(seconds * 1000, 30_000);
+	}
+	const cap = Math.min(16_000, 500 * 2 ** attempt);
+	return cap / 2 + Math.random() * (cap / 2);
+};
+
+const errorReason = (response: RequestUrlResponse) => {
+	try {
+		const body = response.json as {
+			error?: { errors?: { reason?: string }[]; status?: string };
+		};
+		return (
+			body?.error?.errors?.[0]?.reason ?? body?.error?.status ?? ''
+		);
+	} catch {
+		return '';
+	}
+};
 
 const serializeBody = async (
 	options: RequestOptions,
@@ -56,41 +100,84 @@ const toDriveResponse = (response: RequestUrlResponse): DriveResponse => ({
 });
 
 export const getDriveAgent = (t: ObsidianGoogleDrive) => {
+	const ensureToken = async (force = false) => {
+		if (
+			force ||
+			!t.accessToken.token ||
+			t.accessToken.expiresAt - Date.now() < 60_000
+		) {
+			if (!(await refreshAccessToken(t))) {
+				throw new DriveRequestError(401, 'not signed in');
+			}
+		}
+	};
+
 	const send = (
 		method: string,
 		path: string,
 		options: RequestOptions = {},
 	) => {
 		const response = (async () => {
-			if (
-				t.accessToken.token &&
-				t.accessToken.expiresAt - Date.now() < 60_000
-			) {
-				await refreshAccessToken(t);
-			}
-
+			// Serialize once; retries reuse the same bytes.
 			const { body, contentType } = await serializeBody(options);
-			const headers = { ...options.headers };
-			if (t.accessToken.token) {
-				headers.Authorization = `Bearer ${t.accessToken.token}`;
-			}
+			const url = new URL(path, 'https://www.googleapis.com/').toString();
+			let refreshedAfter401 = false;
 
-			const result = await requestUrl({
-				url: new URL(path, 'https://www.googleapis.com/').toString(),
-				method,
-				headers,
-				body,
-				contentType,
-				throw: false,
-			});
+			for (let attempt = 0; ; attempt++) {
+				await ensureToken();
 
-			if (result.status < 200 || result.status >= 300) {
-				new Notice(`Error: ${result.text}`);
-				throw new Error(
-					`Request failed with status ${result.status}: ${result.text}`,
-				);
+				let result: RequestUrlResponse;
+				try {
+					result = await requestUrl({
+						url,
+						method,
+						headers: {
+							...options.headers,
+							Authorization: `Bearer ${t.accessToken.token}`,
+						},
+						body,
+						contentType,
+						throw: false,
+					});
+				} catch (error) {
+					// Network failure: retry unless we are clearly offline.
+					if (attempt + 1 >= MAX_ATTEMPTS || !navigator.onLine) {
+						throw error;
+					}
+					await sleep(backoffDelay(attempt));
+					continue;
+				}
+
+				if (result.status >= 200 && result.status < 300) {
+					return toDriveResponse(result);
+				}
+
+				if (result.status === 401 && !refreshedAfter401) {
+					refreshedAfter401 = true;
+					await ensureToken(true);
+					continue;
+				}
+
+				const reason = errorReason(result);
+				const retryable =
+					RETRYABLE_STATUS.has(result.status) ||
+					(result.status === 403 && RETRYABLE_REASONS.has(reason));
+
+				if (retryable && attempt + 1 < MAX_ATTEMPTS) {
+					await sleep(
+						backoffDelay(attempt, result.headers?.['retry-after']),
+					);
+					continue;
+				}
+
+				// Never surface response bodies in notices: they can echo
+				// file names, IDs, or tokens. Details stay in the console.
+				console.error(`Drive ${method} ${path.split('?')[0]} failed`, {
+					status: result.status,
+					reason,
+				});
+				throw new DriveRequestError(result.status, reason);
 			}
-			return toDriveResponse(result);
 		})();
 
 		return {
@@ -111,78 +198,4 @@ export const getDriveAgent = (t: ObsidianGoogleDrive) => {
 		delete: (path: string, options?: RequestOptions) =>
 			send('DELETE', path, options),
 	};
-};
-
-export const refreshAccessToken = async (
-	t: ObsidianGoogleDrive,
-	refreshToken?: string,
-) => {
-	try {
-		const token = refreshToken || t.settings.refreshToken;
-		const hasCustomClient = Boolean(
-			t.settings.clientId && t.settings.clientSecret,
-		);
-		const response = await requestUrl(
-			hasCustomClient
-				? {
-						url: 'https://oauth2.googleapis.com/token',
-						method: 'POST',
-						contentType: 'application/x-www-form-urlencoded',
-						body: new URLSearchParams({
-							client_id: t.settings.clientId,
-							client_secret: t.settings.clientSecret,
-							grant_type: 'refresh_token',
-							refresh_token: token,
-						}).toString(),
-						throw: false,
-					}
-				: {
-						url:
-							t.settings.accessTokenUrl ||
-							'https://ogd-server.richardxiong.com/api/access',
-						method: 'POST',
-						contentType: 'application/json',
-						body: JSON.stringify({
-							refresh_token: token,
-							clientId: t.settings.clientId,
-							clientSecret: t.settings.clientSecret,
-						}),
-						throw: false,
-					},
-		);
-
-		if ([400, 401, 403].includes(response.status)) {
-			console.error(
-				`Refresh token rejected (HTTP ${response.status}): ${response.text}`,
-			);
-			new Notice(
-				'Your refresh token was rejected. Please add a new refresh token and try again.',
-				0,
-			);
-			return;
-		}
-
-		if (response.status < 200 || response.status >= 300) {
-			new Notice(
-				`Could not refresh your access token (HTTP ${response.status}). Your refresh token was kept; please try again.`,
-			);
-			return;
-		}
-
-		const { expires_in, access_token } = response.json as {
-			expires_in: number;
-			access_token: string;
-		};
-
-		t.accessToken = {
-			token: access_token,
-			expiresAt: Date.now() + expires_in * 1000,
-		};
-		return t.accessToken;
-	} catch {
-		new Notice(
-			'Could not refresh your access token. Your refresh token was kept; check your connection and try again.',
-		);
-	}
-	return;
 };

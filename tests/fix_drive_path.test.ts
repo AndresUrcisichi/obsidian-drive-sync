@@ -1,72 +1,46 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-const notice = vi.hoisted(() => vi.fn());
+const pull = vi.hoisted(() => vi.fn(async () => true));
 
-vi.mock('obsidian', () => ({
-	Notice: notice,
-	requestUrl: vi.fn(),
-	TAbstractFile: class {},
-	TFolder: class {},
-}));
+vi.mock('obsidian', () => ({ Notice: vi.fn() }));
+vi.mock('../helpers/pull', () => ({ pull }));
 
 import { fixDrivePath } from '../helpers/fix_drive_path';
 
+const createPlugin = (syncing = false) => ({
+	syncing,
+	settings: {
+		driveIdToPath: { 'a-id': 'a.md' },
+		driveIdToMd5: { 'a-id': 'abc' },
+		changesToken: 'token',
+		operations: { 'a.md': 'modify' },
+	},
+	saveSettings: vi.fn(async () => undefined),
+});
+
 describe('fixDrivePath', () => {
-	beforeEach(() => {
-		notice.mockReset();
-	});
-
-	it('rebuilds the Drive ID mapping and clears pending operations', async () => {
-		const searchFiles = vi.fn(async () => [
-			{
-				id: 'short-path-id',
-				properties: { path: 'folder/note.md' },
-			},
-			{
-				id: 'split-path-id',
-				properties: {
-					path: 'long/folder/',
-					path2: 'nested/note.md',
-				},
-			},
-		]);
-		const plugin = {
-			drive: { searchFiles },
-			settings: {
-				driveIdToPath: { stale: 'old/path.md' },
-				operations: { 'pending.md': 'create' },
-			},
-		};
+	it('forgets the local index and rebuilds it with a full pull', async () => {
+		const plugin = createPlugin();
 
 		await fixDrivePath(plugin as never);
 
-		expect(searchFiles).toHaveBeenCalledWith({
-			include: ['id', 'properties'],
+		expect(plugin.settings).toEqual({
+			driveIdToPath: {},
+			driveIdToMd5: {},
+			changesToken: '',
+			operations: {},
 		});
-		expect(plugin.settings.driveIdToPath).toEqual({
-			'short-path-id': 'folder/note.md',
-			'split-path-id': 'long/folder/nested/note.md',
-		});
-		expect(plugin.settings.operations).toEqual({});
-		expect(notice).toHaveBeenCalledWith(
-			'Google Drive paths have been fixed. Please restart the plugin to apply changes.',
-		);
+		expect(plugin.saveSettings).toHaveBeenCalledOnce();
+		expect(pull).toHaveBeenCalledWith(plugin);
 	});
 
-	it('preserves existing state when Drive files cannot be fetched', async () => {
-		const driveIdToPath = { existing: 'note.md' };
-		const operations = { 'pending.md': 'modify' };
-		const plugin = {
-			drive: { searchFiles: vi.fn(async () => undefined) },
-			settings: { driveIdToPath, operations },
-		};
+	it('does nothing while a sync is running', async () => {
+		pull.mockClear();
+		const plugin = createPlugin(true);
 
 		await fixDrivePath(plugin as never);
 
-		expect(plugin.settings.driveIdToPath).toBe(driveIdToPath);
-		expect(plugin.settings.operations).toBe(operations);
-		expect(notice).toHaveBeenCalledWith(
-			'An error occurred fetching Google Drive files.',
-		);
+		expect(plugin.settings.changesToken).toBe('token');
+		expect(pull).not.toHaveBeenCalled();
 	});
 });

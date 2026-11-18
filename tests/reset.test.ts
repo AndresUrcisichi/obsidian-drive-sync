@@ -79,10 +79,7 @@ describe('reset', () => {
 		const content = new ArrayBuffer(3);
 		const syncNotice = { setMessage: vi.fn(), hide: vi.fn() };
 		const drive = {
-			searchFiles: vi
-				.fn()
-				.mockResolvedValueOnce([])
-				.mockResolvedValueOnce([
+			searchFiles: vi.fn().mockResolvedValueOnce([
 					{
 						id: 'deleted-id',
 						mimeType: 'text/markdown',
@@ -90,7 +87,10 @@ describe('reset', () => {
 						modifiedTime: '2025-01-01T00:00:00.000Z',
 					},
 				]),
-			getChanges: vi.fn(async () => []),
+			getChanges: vi.fn(async () => ({
+				changes: [],
+				newStartPageToken: 'next',
+			})),
 			deleteFilesMinimumOperations: vi.fn(async () => undefined),
 			getFile: vi.fn(() => ({
 				arrayBuffer: vi.fn(async () => content),
@@ -104,6 +104,7 @@ describe('reset', () => {
 			app: {
 				vault: {
 					configDir: 'config',
+					getName: () => 'Vault',
 					adapter: {
 						exists: vi.fn(async () => false),
 					},
@@ -123,6 +124,7 @@ describe('reset', () => {
 					'modified-id': 'modified.md',
 					'deleted-id': 'deleted.md',
 				},
+				driveIdToMd5: {},
 				lastSyncedAt: 0,
 				changesToken: 'changes',
 			},

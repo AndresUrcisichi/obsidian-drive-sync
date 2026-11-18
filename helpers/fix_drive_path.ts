@@ -1,21 +1,18 @@
 import { Notice } from 'obsidian';
-import ObsidianGoogleDrive from '../main';
-import { unSplitPath } from './drive';
+import type ObsidianGoogleDrive from '../main';
+import { pull } from './pull';
 
+/**
+ * Forgets this device's Drive ID map and rebuilds it from a full listing.
+ * Files whose content matches Drive (by MD5) are adopted without transfer.
+ */
 export const fixDrivePath = async (t: ObsidianGoogleDrive) => {
-	const driveFiles = await t.drive.searchFiles({
-		include: ['id', 'properties'],
-	});
-	if (!driveFiles) {
-		new Notice('An error occurred fetching Google Drive files.');
-		return;
-	}
-	const idToPath = Object.fromEntries(
-		driveFiles.map(({ id, properties }) => [id, unSplitPath(properties)]),
-	);
-	t.settings.driveIdToPath = idToPath;
+	if (t.syncing) return;
+	t.settings.driveIdToPath = {};
+	t.settings.driveIdToMd5 = {};
+	t.settings.changesToken = '';
 	t.settings.operations = {};
-	new Notice(
-		'Google Drive paths have been fixed. Please restart the plugin to apply changes.',
-	);
+	await t.saveSettings();
+	new Notice('Rebuilding the sync index from Google Drive…');
+	await pull(t);
 };

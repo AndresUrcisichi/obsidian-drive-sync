@@ -78,6 +78,7 @@ vi.mock('obsidian', () => {
 
 import { TFile, TFolder } from 'obsidian';
 import { ConfirmUndoModal, push } from '../helpers/push';
+import { md5 } from '../helpers/md5';
 
 describe('push', () => {
 	it('does nothing while another sync is running', async () => {
@@ -104,23 +105,25 @@ describe('push', () => {
 			name: 'changed.md',
 			parent: root,
 		});
+		const unchanged = Object.assign(new TFile(), { path: 'unchanged.md', name: 'unchanged.md', parent: root });
 		const files = new Map<string, TFile | TFolder>([
 			[folder.path, folder],
 			[created.path, created],
 			[modified.path, modified],
+			[unchanged.path, unchanged],
 		]);
 		const syncNotice = { setMessage: vi.fn(), hide: vi.fn() };
 		const drive = {
-			searchFiles: vi
-				.fn()
-				.mockResolvedValueOnce([])
-				.mockResolvedValueOnce([]),
-			getChanges: vi.fn(async () => []),
+			searchFiles: vi.fn().mockResolvedValueOnce([]),
+			getChanges: vi.fn(async () => ({
+				changes: [],
+				newStartPageToken: 'next',
+			})),
 			batchDelete: vi.fn(async () => true),
 			getRootFolderId: vi.fn(async () => 'root-id'),
 			createFolder: vi.fn(async () => 'folder-id'),
-			uploadFile: vi.fn(async () => 'created-id'),
-			updateFile: vi.fn(async () => 'updated-id'),
+			uploadFile: vi.fn(async () => ({ id: 'created-id', md5Checksum: 'm1' })),
+			updateFile: vi.fn(async () => ({ id: 'changed-id', md5Checksum: 'm2' })),
 			getConfigFilesToSync: vi.fn(async () => []),
 		};
 		const plugin = {
@@ -128,6 +131,7 @@ describe('push', () => {
 			app: {
 				vault: {
 					configDir: '.config',
+					getName: () => 'Vault',
 					adapter: { exists: vi.fn(async () => true) },
 					getAllLoadedFiles: vi.fn(() => [...files.values()]),
 					getAbstractFileByPath: vi.fn((path: string) => files.get(path)),
@@ -142,16 +146,24 @@ describe('push', () => {
 					folder: 'create',
 					'folder/new.md': 'create',
 					'changed.md': 'modify',
-				},
+					'unchanged.md': 'modify',
+					'never-synced.md': 'delete',
+				} as Record<string, string>,
 				driveIdToPath: {
 					'deleted-id': 'deleted.md',
 					'changed-id': 'changed.md',
-					'data-id': '.config/plugins/google-drive-sync/data.json',
-				},
+					'unchanged-id': 'unchanged.md',
+				} as Record<string, string>,
+				driveIdToMd5: {
+					'unchanged-id': md5(new Uint8Array(1)),
+				} as Record<string, string>,
 				lastSyncedAt: 0,
 				changesToken: 'changes',
 			},
 			drive,
+			manifest: { id: 'gdrive-vault-sync' },
+			touchedDuringSync: new Set<string>(),
+			saveSettings: vi.fn(async () => undefined),
 			startSync: vi.fn(async () => syncNotice),
 			endSync: vi.fn(async () => {
 				plugin.syncing = false;
@@ -166,11 +178,15 @@ describe('push', () => {
 		expect(drive.getRootFolderId).toHaveBeenCalledWith(true);
 		expect(drive.createFolder).toHaveBeenCalled();
 		expect(drive.uploadFile).toHaveBeenCalled();
+		expect(drive.updateFile).toHaveBeenCalledOnce();
 		expect(drive.updateFile).toHaveBeenCalledWith(
 			'changed-id',
 			expect.any(Blob),
 			expect.any(Object),
 		);
+		expect(plugin.settings.driveIdToPath['created-id']).toBe('folder/new.md');
+		expect(plugin.settings.driveIdToMd5['created-id']).toBe('m1');
+		expect(plugin.settings.driveIdToMd5['changed-id']).toBe('m2');
 		expect(plugin.settings.operations).toEqual({});
 		expect(plugin.endSync).toHaveBeenCalledWith(syncNotice, false);
 	});

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-1oN6FbwiGOlyBIcb2qIIgm5l/WSsSyCF96NMg1S75l0='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>GDrive Vault Sync sign-in</title>
+<style>
+	:root { color-scheme: light dark; --bg: #fafafa; --fg: #1d1d1f; --muted: #6e6e73; --card: #fff; --accent: #7c3aed; --border: #e5e5ea; }
+	@media (prefers-color-scheme: dark) { :root { --bg: #111113; --fg: #f5f5f7; --muted: #a1a1a6; --card: #1c1c1f; --border: #2c2c30; } }
+	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, sans-serif; }
+	main { max-width: 32rem; margin: 12vh auto 0; padding: 0 16px; }
+	.card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px; }
+	h1 { font-size: 1.25rem; margin: 0 0 8px; }
+	p { color: var(--muted); margin: 0 0 16px; }
+	a.button, button { display: inline-block; background: var(--accent); color: #fff; border: 0; border-radius: 10px; padding: 12px 18px; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+	code { display: block; word-break: break-all; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin: 8px 0 12px; font-size: 13px; }
+	[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+	<div class="card">
+		<h1 id="title">Returning to Obsidian…</h1>
+		<p id="message">If Obsidian does not open, use the button below.</p>
+		<div id="actions" hidden>
+			<a class="button" id="open">Open Obsidian</a>
+			<p style="margin-top:20px">Or copy this code into the plugin settings under <b>Paste sign-in code</b>:</p>
+			<code id="code"></code>
+			<button id="copy" type="button">Copy code</button>
+		</div>
+	</div>
+</main>
+<script>
+(function () {
+	var params = new URLSearchParams(location.search);
+	// Drop the code from the address bar and history right away.
+	history.replaceState(null, '', location.pathname);
+
+	var title = document.getElementById('title');
+	var message = document.getElementById('message');
+	var error = params.get('error');
+	var code = params.get('code') || '';
+	var state = params.get('state') || '';
+	var valid = /^[\w\-./]+$/;
+
+	if (error || !valid.test(code) || !valid.test(state)) {
+		title.textContent = 'Sign-in was not completed';
+		message.textContent = error === 'access_denied'
+			? 'Access was denied. Start again from the plugin settings.'
+			: 'The sign-in response was missing or invalid. Start again from the plugin settings.';
+		return;
+	}
+
+	var vault = '';
+	try {
+		var encoded = state.split('.')[1] || '';
+		var b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+		var bytes = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+		vault = new TextDecoder().decode(bytes);
+	} catch (e) { vault = ''; }
+
+	var query = new URLSearchParams({ code: code, state: state });
+	if (vault) query.set('vault', vault);
+	var target = 'obsidian://gdrive-vault-sync-auth?' + query.toString();
+
+	document.getElementById('open').href = target;
+	document.getElementById('code').textContent = state + '|' + code;
+	document.getElementById('actions').hidden = false;
+	document.getElementById('copy').addEventListener('click', function () {
+		navigator.clipboard.writeText(state + '|' + code).then(function () {
+			document.getElementById('copy').textContent = 'Copied';
+		});
+	});
+
+	location.href = target;
+})();
+</script>
+</body>
+</html>

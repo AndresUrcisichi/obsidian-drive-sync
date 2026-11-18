@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.stubGlobal('window', globalThis);
+
 const requestUrl = vi.hoisted(() => vi.fn());
 
 vi.mock('obsidian', () => ({
@@ -9,7 +11,12 @@ vi.mock('obsidian', () => ({
 	TFolder: class {},
 }));
 
-import { getDriveClient, splitPath, unSplitPath } from '../helpers/drive';
+import {
+	batchAsync,
+	getDriveClient,
+	splitPath,
+	unSplitPath,
+} from '../helpers/drive';
 
 const createPlugin = () =>
 	({
@@ -120,6 +127,24 @@ describe('Drive batch deletion', () => {
 			headers: {},
 			arrayBuffer: new ArrayBuffer(0),
 			json: {},
+			text: [
+				'HTTP/1.1 204 No Content',
+				'HTTP/1.1 500 Internal Server Error',
+			].join('\r\n'),
+		});
+		const drive = getDriveClient(createPlugin());
+
+		await expect(
+			drive.batchDelete(['file-1', 'broken-file']),
+		).resolves.toBeUndefined();
+	});
+
+	it('treats files another device already deleted as deleted', async () => {
+		requestUrl.mockResolvedValueOnce({
+			status: 200,
+			headers: {},
+			arrayBuffer: new ArrayBuffer(0),
+			json: {},
 			text: ['HTTP/1.1 204 No Content', 'HTTP/1.1 404 Not Found'].join(
 				'\r\n',
 			),
@@ -128,7 +153,7 @@ describe('Drive batch deletion', () => {
 
 		await expect(
 			drive.batchDelete(['file-1', 'missing-file']),
-		).resolves.toBeUndefined();
+		).resolves.toBe(true);
 	});
 });
 
@@ -171,5 +196,26 @@ describe('Drive root folder persistence', () => {
 
 		expect(requestUrl).toHaveBeenCalledOnce();
 		expect(plugin.saveSettings).toHaveBeenCalledOnce();
+	});
+});
+
+describe('batchAsync', () => {
+	it('never runs more than the concurrency limit and keeps order', async () => {
+		let running = 0;
+		let peak = 0;
+		const tasks = Array.from({ length: 25 }, (_, i) => async () => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((resolve) =>
+				window.setTimeout(resolve, (i % 5) * 2),
+			);
+			running--;
+			return i;
+		});
+
+		const results = await batchAsync(tasks, 4);
+
+		expect(peak).toBe(4);
+		expect(results).toEqual(Array.from({ length: 25 }, (_, i) => i));
 	});
 });

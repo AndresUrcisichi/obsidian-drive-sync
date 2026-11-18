@@ -1,6 +1,6 @@
 import type ObsidianGoogleDrive from '../main';
 import { getDriveAgent } from './requests';
-import { requestUrl, TAbstractFile, TFolder } from 'obsidian';
+import { TAbstractFile, TFolder } from 'obsidian';
 
 export interface FileMetadata {
 	id: string;
@@ -11,6 +11,7 @@ export interface FileMetadata {
 	properties: Record<string, string>;
 	modifiedTime: string;
 	trashed: boolean;
+	md5Checksum?: string;
 }
 
 type StringSearch = string | { contains: string } | { not: string };
@@ -26,13 +27,19 @@ interface QueryMatch {
 	modifiedTime?: DateComparison;
 }
 
-interface Change {
-	kind: string;
+export interface Change {
 	removed: boolean;
-	file: FileMetadata;
+	file?: FileMetadata;
 	fileId: string;
-	time: string;
 }
+
+export interface UploadResult {
+	id: string;
+	md5Checksum?: string;
+}
+
+const CHANGE_FIELDS =
+	'nextPageToken,newStartPageToken,changes(removed,fileId,file(id,mimeType,md5Checksum,modifiedTime,trashed,properties))';
 
 export const folderMimeType = 'application/vnd.google-apps.folder';
 
@@ -180,7 +187,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						? ''
 						: '&orderBy=name' +
 							(order === 'ascending' ? '' : ' desc')
-				}${pageToken ? '&pageToken=' + pageToken : ''}`,
+				}${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`,
 			)
 			.json();
 		if (!files) return;
@@ -333,13 +340,14 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		form.append('file', file);
 
 		const result = await drive
-			.post(`upload/drive/v3/files?uploadType=multipart&fields=id`, {
-				body: form,
-			})
-			.json<{ id: string }>();
-		if (!result) return;
+			.post(
+				`upload/drive/v3/files?uploadType=multipart&fields=id,md5Checksum`,
+				{ body: form },
+			)
+			.json<UploadResult>();
+		if (!result?.id) return;
 
-		return result.id;
+		return result;
 	};
 
 	const updateFile = async (
@@ -358,15 +366,13 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 		const result = await drive
 			.patch(
-				`upload/drive/v3/files/${id}?uploadType=multipart&fields=id`,
-				{
-					body: form,
-				},
+				`upload/drive/v3/files/${id}?uploadType=multipart&fields=id,md5Checksum`,
+				{ body: form },
 			)
-			.json<{ id: string }>();
-		if (!result) return;
+			.json<UploadResult>();
+		if (!result?.id) return;
 
-		return result.id;
+		return result;
 	};
 
 	const updateFileMetadata = async (
@@ -392,7 +398,9 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		drive.get(`drive/v3/files/${id}?alt=media&acknowledgeAbuse=true`);
 
 	const getFileMetadata = (id: string) =>
-		drive.get(`drive/v3/files/${id}`).json<FileMetadata>();
+		drive
+			.get(`drive/v3/files/${id}?fields=id,modifiedTime,md5Checksum`)
+			.json<FileMetadata>();
 
 	const idFromPath = async (path: string) => {
 		const files = await searchFiles({
@@ -449,7 +457,11 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			);
 			if (
 				statuses.length !== batch.length ||
-				statuses.some((status) => status < 200 || status >= 300)
+				// 404 means another device already deleted it.
+				statuses.some(
+					(status) =>
+						(status < 200 || status >= 300) && status !== 404,
+				)
 			) {
 				return;
 			}
@@ -465,9 +477,12 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		return result.startPageToken;
 	};
 
+	/**
+	 * Reads the Drive changes feed from `startToken`. With the drive.file scope
+	 * the feed only contains files this app created, so it stays small even on
+	 * a busy multi-terabyte Drive. Returns the token to resume from next time.
+	 */
 	const getChanges = async (startToken: string) => {
-		if (!startToken) return [];
-
 		const request = (token: string) =>
 			drive
 				.get(
@@ -475,6 +490,8 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						pageToken: token,
 						pageSize: '1000',
 						includeRemoved: 'true',
+						spaces: 'drive',
+						fields: CHANGE_FIELDS,
 					}).toString()}`,
 				)
 				.json<{
@@ -493,7 +510,11 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			result.nextPageToken = nextPage.nextPageToken;
 		}
 
-		return result.changes;
+		if (!result.newStartPageToken) return;
+		return {
+			changes: result.changes,
+			newStartPageToken: result.newStartPageToken,
+		};
 	};
 
 	const deleteFilesMinimumOperations = async (files: TAbstractFile[]) => {
@@ -531,6 +552,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		const configFilesToSync: string[] = [];
 		const { vault } = t.app;
 		const { adapter } = vault;
+		if (!t.settings.syncConfig) return configFilesToSync;
 
 		const [configFiles, plugins] = await Promise.all([
 			adapter.list(vault.configDir),
@@ -556,10 +578,11 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						const files = await adapter.list(plugin);
 						await Promise.all(
 							files.files
-								.filter((path) =>
-									WHITELISTED_PLUGIN_FILES.includes(
-										fileNameFromPath(path),
-									),
+								.filter(
+									(path) =>
+										WHITELISTED_PLUGIN_FILES.includes(
+											fileNameFromPath(path),
+										) && !isPrivatePluginFile(t, path),
 								)
 								.map(async (path) => {
 									const file = await adapter.stat(path);
@@ -594,33 +617,37 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		getChangesStartToken,
 		getChanges,
 		batchDelete,
-		checkConnection,
 		deleteFilesMinimumOperations,
 		getConfigFilesToSync,
 	};
 };
 
-export const checkConnection = async () => {
-	try {
-		const result = await requestUrl({
-			url: 'https://www.google.com/generate_204',
-			throw: false,
-		});
-		return result.status >= 200 && result.status < 300;
-	} catch {
-		return false;
-	}
-};
+/**
+ * This plugin's own data.json holds per-device sync state and must never be
+ * uploaded: every device keeps its own operation log and Drive ID map.
+ */
+export const isPrivatePluginFile = (t: ObsidianGoogleDrive, path: string) =>
+	path === `${t.app.vault.configDir}/plugins/${t.manifest.id}/data.json`;
 
+/**
+ * Runs tasks with a fixed number of workers. Unlike fixed-size batches, a slow
+ * file never blocks the next ones from starting. Results keep input order.
+ */
 export const batchAsync = async <T = unknown>(
 	requests: (() => Promise<T>)[],
-	batchSize = 10,
+	concurrency = 8,
 ) => {
-	const results = [];
-	for (let i = 0; i < requests.length; i += batchSize) {
-		const batch = requests.slice(i, i + batchSize);
-		results.push(...(await Promise.all(batch.map((request) => request()))));
-	}
+	const results = new Array<T>(requests.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < requests.length) {
+			const index = next++;
+			results[index] = await (requests[index] as () => Promise<T>)();
+		}
+	};
+	await Promise.all(
+		Array.from({ length: Math.min(concurrency, requests.length) }, worker),
+	);
 	return results;
 };
 

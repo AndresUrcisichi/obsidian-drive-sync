@@ -33,9 +33,8 @@ import ObsidianGoogleDrive from '../main';
 const createPlugin = () =>
 	Object.assign(Object.create(ObsidianGoogleDrive.prototype), {
 		settings: {
-			refreshToken: 'refresh',
-			accessTokenUrl: 'https://ogd-server.richardxiong.com/api/access',
 			autoPush: false,
+			autoPushDelaySeconds: 60,
 			operations: {},
 			driveIdToPath: {},
 			rootFolderId: '',
@@ -48,11 +47,13 @@ const createPlugin = () =>
 			addClass: vi.fn(),
 			removeClass: vi.fn(),
 		},
+		touchedDuringSync: new Set<string>(),
 		drive: {
 			getConfigFilesToSync: vi.fn(async () => []),
 			getChangesStartToken: vi.fn(async () => 'new-token'),
 		},
 		app: {
+			secretStorage: { getSecret: vi.fn(() => 'refresh') },
 			vault: {
 				adapter: {
 					readBinary: vi.fn(),
@@ -125,27 +126,48 @@ describe('ObsidianGoogleDrive operation tracking', () => {
 });
 
 describe('ObsidianGoogleDrive sync lifecycle', () => {
-	it('stores a new checkpoint only after it is available', async () => {
+	it('finishes without asking Drive for a fresh checkpoint', async () => {
 		vi.spyOn(Date, 'now').mockReturnValue(1234);
 		const plugin = createPlugin();
 
 		await expect(plugin.endSync(undefined, false)).resolves.toBe(true);
 
+		// The checkpoint comes from the changes feed during pull; fetching a
+		// new one here would skip edits uploaded by others mid-sync.
+		expect(plugin.drive.getChangesStartToken).not.toHaveBeenCalled();
+		expect(plugin.settings.changesToken).toBe('old-token');
 		expect(plugin.settings.lastSyncedAt).toBe(1234);
-		expect(plugin.settings.changesToken).toBe('new-token');
 		expect(plugin.saveSettings).toHaveBeenCalledOnce();
 		expect(plugin.syncing).toBe(false);
 	});
 
-	it('leaves the previous checkpoint intact when fetching one fails', async () => {
+	it('remembers paths the user edits while a sync is running', () => {
 		const plugin = createPlugin();
-		plugin.drive.getChangesStartToken = vi.fn(async () => undefined);
 
-		await expect(plugin.endSync(undefined, false)).resolves.toBe(false);
+		plugin.handleModify(Object.assign(new TFile(), { path: 'during.md' }));
 
-		expect(plugin.settings.lastSyncedAt).toBe(0);
-		expect(plugin.settings.changesToken).toBe('old-token');
-		expect(plugin.saveSettings).not.toHaveBeenCalled();
-		expect(plugin.syncing).toBe(false);
+		expect(plugin.touchedDuringSync.has('during.md')).toBe(true);
+	});
+});
+
+describe('ObsidianGoogleDrive settings migration', () => {
+	it('drops upstream credentials from data.json', async () => {
+		const plugin = createPlugin();
+		Object.assign(plugin, {
+			loadData: vi.fn(async () => ({
+				refreshToken: 'leaked',
+				accessTokenUrl: 'https://example.com',
+				clientSecret: 'secret',
+				autoPush: false,
+			})),
+		});
+
+		await plugin.loadSettings();
+
+		expect(plugin.settings).not.toHaveProperty('refreshToken');
+		expect(plugin.settings).not.toHaveProperty('accessTokenUrl');
+		expect(plugin.settings).not.toHaveProperty('clientSecret');
+		expect(plugin.settings.autoPush).toBe(false);
+		expect(plugin.saveSettings).toHaveBeenCalledOnce();
 	});
 });

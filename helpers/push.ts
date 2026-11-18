@@ -1,5 +1,6 @@
 import type ObsidianGoogleDrive from '../main';
 import { Modal, Notice, setIcon, Setting, TFile, TFolder } from 'obsidian';
+import { md5 } from './md5';
 import {
 	batchAsync,
 	fileNameFromPath,
@@ -276,17 +277,22 @@ export const push = async (
 			return;
 		}
 
-		const operations = Object.entries(t.settings.operations);
-
-		const deletes = operations.filter(([_, op]) => op === 'delete');
-		const creates = operations.filter(([_, op]) => op === 'create');
-		const modifies = operations.filter(([_, op]) => op === 'modify');
-
 		const pathsToIds = Object.fromEntries(
 			Object.entries(t.settings.driveIdToPath).map(([id, path]) => [
 				path,
 				id,
 			]),
+		);
+
+		const operations = Object.entries(t.settings.operations);
+		const deletes = operations.filter(([_, op]) => op === 'delete');
+		// A "create" for a path Drive already has is an update.
+		const creates = operations.filter(
+			([path, op]) => op === 'create' && !pathsToIds[path],
+		);
+		const modifies = operations.filter(
+			([path, op]) =>
+				op === 'modify' || (op === 'create' && pathsToIds[path]),
 		);
 
 		const configOnDrive = await t.drive.searchFiles({
@@ -308,193 +314,175 @@ export const push = async (
 		);
 
 		if (deletes.length) {
-			const idsToDelete = deletes.map(([path]) => {
-				const id = pathsToIds[path];
-				return id;
-			});
-			if (idsToDelete.some((id) => !id)) {
-				new Notice(
-					'Could not identify all Google Drive files to delete.',
-				);
-				return;
-			}
-
-			const uniqueIds = [...new Set(idsToDelete as string[])];
-			const deleteRequest = await t.drive.batchDelete(uniqueIds);
-			if (!deleteRequest) {
+			// Paths Drive never had need no remote delete.
+			const uniqueIds = [
+				...new Set(
+					deletes
+						.map(([path]) => pathsToIds[path])
+						.filter((id): id is string => Boolean(id)),
+				),
+			];
+			if (!(await t.drive.batchDelete(uniqueIds))) {
 				new Notice('An error occurred deleting Google Drive files.');
 				return;
 			}
-			uniqueIds.forEach((id) => delete t.settings.driveIdToPath[id]);
+			uniqueIds.forEach((id) => {
+				const path = t.settings.driveIdToPath[id];
+				delete t.settings.driveIdToPath[id];
+				delete t.settings.driveIdToMd5[id];
+				if (path) delete pathsToIds[path];
+			});
 		}
 
 		syncNotice.setMessage('Syncing (33%)');
 
-		if (creates.length) {
-			let completed = 0;
-			const files = creates.map(([path]) =>
-				vault.getAbstractFileByPath(path),
-			);
+		const createFolderOnDrive = async (
+			path: string,
+			extraProperties: Record<string, string> = {},
+		) => {
+			const parentPath = path.split('/').slice(0, -1).join('/');
+			const id = await t.drive.createFolder({
+				name: fileNameFromPath(path),
+				parent: parentPath ? pathsToIds[parentPath] : undefined,
+				properties: { ...splitPath(path), ...extraProperties },
+				modifiedTime: new Date().toISOString(),
+			});
+			if (!id) throw new Error(`Could not create folder ${path}`);
+			t.settings.driveIdToPath[id] = path;
+			pathsToIds[path] = id;
+		};
 
-			const folders = files.filter((file) => file instanceof TFolder);
-
-			if (folders.length) {
-				const batches = foldersToBatches(folders);
-
-				for (const batch of batches) {
-					await batchAsync(
-						batch.map((folder) => async () => {
-							const id = await t.drive.createFolder({
-								name: folder.name,
-								parent: folder.parent
-									? pathsToIds[folder.parent.path]
-									: undefined,
-								properties: splitPath(folder.path),
-								modifiedTime: new Date().toISOString(),
-							});
-							if (!id) {
-								new Notice(
-									'An error occurred creating Google Drive folders.',
-								);
-								return;
-							}
-
-							completed++;
-							syncNotice.setMessage(
-								getSyncMessage(33, 66, completed, files.length),
-							);
-
-							t.settings.driveIdToPath[id] = folder.path;
-							pathsToIds[folder.path] = id;
-						}),
-					);
+		const ensureFolders = async (
+			paths: Iterable<string>,
+			extraProperties?: Record<string, string>,
+		) => {
+			const missing = new Set<string>();
+			for (const path of paths) {
+				const parts = path.split('/');
+				for (let i = 1; i <= parts.length; i++) {
+					const folder = parts.slice(0, i).join('/');
+					if (!pathsToIds[folder]) missing.add(folder);
 				}
 			}
+			if (!missing.size) return;
+			for (const batch of foldersToBatches(Array.from(missing))) {
+				await batchAsync(
+					batch.map(
+						(folder) => () =>
+							createFolderOnDrive(folder, extraProperties),
+					),
+				);
+			}
+		};
+
+		let completed = 0;
+		const total = creates.length + modifies.length;
+		const progress = () =>
+			syncNotice.setMessage(
+				getSyncMessage(33, 99, ++completed, total || 1),
+			);
+
+		if (creates.length) {
+			const files = creates
+				.map(([path]) => vault.getAbstractFileByPath(path))
+				.filter((file): file is TFile | TFolder => Boolean(file));
+
+			// Parents first, including ones no operation mentions (for
+			// example after a remote delete of a folder with local edits).
+			await ensureFolders([
+				...files
+					.filter((file) => file instanceof TFolder)
+					.map(({ path }) => path),
+				...files
+					.filter((file) => file instanceof TFile)
+					.map((file) => file.parent?.path ?? '')
+					.filter((path) => path && path !== '/'),
+			]);
 
 			const notes = files.filter((file) => file instanceof TFile);
-
 			await batchAsync(
 				notes.map((note) => async () => {
-					const id = await t.drive.uploadFile(
+					const result = await t.drive.uploadFile(
 						new Blob([await vault.readBinary(note)]),
 						note.name,
-						note.parent ? pathsToIds[note.parent.path] : undefined,
+						note.parent && note.parent.path !== '/'
+							? pathsToIds[note.parent.path]
+							: undefined,
 						{
 							properties: splitPath(note.path),
 							modifiedTime: new Date().toISOString(),
 						},
 					);
-					if (!id) {
-						new Notice(
-							'An error occurred creating Google Drive files.',
-						);
-						return;
+					if (!result) {
+						throw new Error(`Could not upload ${note.path}`);
 					}
-
-					completed++;
-					syncNotice.setMessage(
-						getSyncMessage(33, 66, completed, files.length),
-					);
-
-					t.settings.driveIdToPath[id] = note.path;
+					t.settings.driveIdToPath[result.id] = note.path;
+					if (result.md5Checksum) {
+						t.settings.driveIdToMd5[result.id] = result.md5Checksum;
+					}
+					pathsToIds[note.path] = result.id;
+					progress();
 				}),
 			);
 		}
 
 		if (modifies.length) {
-			let completed = 0;
-
 			const files = modifies
 				.map(([path]) => vault.getFileByPath(path))
-				.filter((file) => file instanceof TFile);
-
-			const pathToId = Object.fromEntries(
-				Object.entries(t.settings.driveIdToPath).map(([id, path]) => [
-					path,
-					id,
-				]),
-			);
+				.filter((file): file is TFile => file instanceof TFile);
 
 			await batchAsync(
 				files.map((file) => async () => {
-					const id = await t.drive.updateFile(
-						pathToId[file.path] as string,
-						new Blob([await vault.readBinary(file)]),
+					const id = pathsToIds[file.path] as string;
+					const bytes = await vault.readBinary(file);
+					progress();
+					// Saves without content changes cost nothing.
+					if (t.settings.driveIdToMd5[id] === md5(bytes)) return;
+
+					const result = await t.drive.updateFile(
+						id,
+						new Blob([bytes]),
 						{ modifiedTime: new Date().toISOString() },
 					);
-					if (!id) {
-						new Notice(
-							'An error occurred modifying Google Drive files.',
-						);
-						return;
+					if (!result) {
+						throw new Error(`Could not update ${file.path}`);
 					}
-
-					completed++;
-					syncNotice.setMessage(
-						getSyncMessage(66, 99, completed, files.length),
-					);
+					if (result.md5Checksum) {
+						t.settings.driveIdToMd5[id] = result.md5Checksum;
+					}
 				}),
 			);
 		}
 
 		const configFilesToSync = await t.drive.getConfigFilesToSync();
-
-		const foldersToCreate = new Set<string>();
-		configFilesToSync.forEach((path) => {
-			const parts = path.split('/');
-			for (let i = 1; i < parts.length; i++) {
-				foldersToCreate.add(parts.slice(0, i).join('/'));
-			}
-		});
-
-		foldersToCreate.forEach((folder) => {
-			if (pathsToIds[folder]) foldersToCreate.delete(folder);
-		});
-
-		if (foldersToCreate.size) {
-			const batches = foldersToBatches(Array.from(foldersToCreate));
-
-			for (const batch of batches) {
-				await batchAsync(
-					batch.map((folder) => async () => {
-						const id = await t.drive.createFolder({
-							name: folder.split('/').pop() || '',
-							parent: pathsToIds[
-								folder.split('/').slice(0, -1).join('/')
-							],
-							properties: {
-								...splitPath(folder),
-								config: 'true',
-							},
-							modifiedTime: new Date().toISOString(),
-						});
-						if (!id) {
-							new Notice(
-								'An error occurred creating Google Drive folders.',
-							);
-							return;
-						}
-
-						t.settings.driveIdToPath[id] = folder;
-						pathsToIds[folder] = id;
-					}),
-				);
-			}
-		}
+		await ensureFolders(
+			configFilesToSync.map((path) =>
+				path.split('/').slice(0, -1).join('/'),
+			),
+			{ config: 'true' },
+		);
 
 		await batchAsync(
 			configFilesToSync.map((path) => async () => {
-				if (pathsToIds[path]) {
-					await t.drive.updateFile(
-						pathsToIds[path],
-						new Blob([await adapter.readBinary(path)]),
+				const bytes = await adapter.readBinary(path);
+				const existingId = pathsToIds[path];
+				if (existingId) {
+					if (t.settings.driveIdToMd5[existingId] === md5(bytes)) {
+						return;
+					}
+					const result = await t.drive.updateFile(
+						existingId,
+						new Blob([bytes]),
 						{ modifiedTime: new Date().toISOString() },
 					);
+					if (result?.md5Checksum) {
+						t.settings.driveIdToMd5[existingId] = result.md5Checksum;
+					}
 					return;
 				}
 
-				const id = await t.drive.uploadFile(
-					new Blob([await adapter.readBinary(path)]),
+				const result = await t.drive.uploadFile(
+					new Blob([bytes]),
 					fileNameFromPath(path),
 					pathsToIds[path.split('/').slice(0, -1).join('/')],
 					{
@@ -502,32 +490,35 @@ export const push = async (
 						modifiedTime: new Date().toISOString(),
 					},
 				);
-				if (!id) {
-					new Notice(
-						'An error occurred creating Google Drive config files.',
-					);
-					return;
+				if (!result) {
+					throw new Error(`Could not upload ${path}`);
 				}
-
-				t.settings.driveIdToPath[id] = path;
-				pathsToIds[path] = id;
+				t.settings.driveIdToPath[result.id] = path;
+				if (result.md5Checksum) {
+					t.settings.driveIdToMd5[result.id] = result.md5Checksum;
+				}
+				pathsToIds[path] = result.id;
 			}),
 		);
 
-		await t.drive.updateFile(
-			pathsToIds[
-				vault.configDir + '/plugins/google-drive-sync/data.json'
-			] as string,
-			new Blob([JSON.stringify(t.settings, null, 2)]),
-			{ modifiedTime: new Date().toISOString() },
-		);
-
-		t.settings.operations = {};
+		// Keep only edits made while this push was running.
+		t.settings.operations = Object.fromEntries(
+			[...t.touchedDuringSync]
+				.map((path) => [path, t.settings.operations[path]] as const)
+				.filter(([, op]) => op),
+		) as typeof t.settings.operations;
 
 		if (!(await t.endSync(syncNotice, false))) return;
 
-		new Notice('Sync complete!');
+		if (!skipConfirmation) new Notice('Sync complete!');
+	} catch (error) {
+		console.error('Google Drive push failed', error);
+		new Notice(
+			'Push did not finish. Your changes are kept and will be retried on the next push.',
+		);
 	} finally {
+		// Persist IDs of whatever did upload, even on failure.
+		await t.saveSettings();
 		if (t.syncing) t.abortSync(syncNotice);
 	}
 };

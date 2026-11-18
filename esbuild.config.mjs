@@ -39,6 +39,17 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: 'main.js',
 	minify: prod,
+	// Optional build-time defaults (from .env, never committed) so a personal
+	// build only needs "Sign in with Google" on each device.
+	define: {
+		__GDVS_CLIENT_ID__: JSON.stringify(process.env.GDVS_CLIENT_ID ?? ''),
+		__GDVS_CLIENT_SECRET__: JSON.stringify(
+			process.env.GDVS_CLIENT_SECRET ?? '',
+		),
+		__GDVS_REDIRECT_URI__: JSON.stringify(
+			process.env.GDVS_REDIRECT_URI ?? '',
+		),
+	},
 });
 
 if (prod) {
