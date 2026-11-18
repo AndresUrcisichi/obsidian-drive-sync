@@ -464,7 +464,7 @@ class SettingsTab extends PluginSettingTab {
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		const plugin = this.plugin;
-		return [
+		const items: SettingDefinitionItem[] = [
 			{
 				name: 'Google account',
 				render: (setting) => {
@@ -616,6 +616,16 @@ class SettingsTab extends PluginSettingTab {
 				},
 			},
 		];
+
+		// Until this device has a client secret, put that field first so it
+		// is next to the sign-in button instead of at the bottom.
+		if (!getClientSecret(plugin)) {
+			const index = items.findIndex(
+				(item) => 'name' in item && item.name === 'Client secret',
+			);
+			if (index > 0) items.unshift(...items.splice(index, 1));
+		}
+		return items;
 	}
 
 	async setControlValue(key: string, value: unknown) {
