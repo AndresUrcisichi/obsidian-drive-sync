@@ -1,6 +1,6 @@
 {
 	"name": "gdrive-vault-sync",
-	"version": "4.0.4",
+	"version": "4.0.5",
 	"description": "Sync an Obsidian vault through your own Google Drive, on desktop and iOS, with no third-party servers.",
 	"main": "main.js",
 	"type": "module",

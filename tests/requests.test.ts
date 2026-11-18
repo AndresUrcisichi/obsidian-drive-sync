@@ -22,6 +22,7 @@ import {
 	DRIVE_SCOPE,
 	finishSignIn,
 	parsePastedCode,
+	prepareSignIn,
 	refreshAccessToken,
 	startSignIn,
 } from '../helpers/auth';
@@ -146,7 +147,8 @@ describe('sign-in', () => {
 		vi.stubGlobal('window', { ...globalThis, open });
 		const plugin = createPlugin();
 
-		await startSignIn(plugin as never);
+		await prepareSignIn(plugin as never);
+		startSignIn(plugin as never);
 
 		const url = new URL(opened(open));
 		expect(url.searchParams.get('scope')).toBe(DRIVE_SCOPE);
@@ -164,7 +166,8 @@ describe('sign-in', () => {
 	it('rejects a callback whose state does not match', async () => {
 		const plugin = createPlugin();
 		vi.stubGlobal('window', { ...globalThis, open: vi.fn() });
-		await startSignIn(plugin as never);
+		await prepareSignIn(plugin as never);
+		startSignIn(plugin as never);
 		vi.stubGlobal('window', globalThis);
 
 		await expect(
@@ -177,7 +180,8 @@ describe('sign-in', () => {
 		const open = vi.fn();
 		vi.stubGlobal('window', { ...globalThis, open });
 		const plugin = createPlugin();
-		await startSignIn(plugin as never);
+		await prepareSignIn(plugin as never);
+		startSignIn(plugin as never);
 		vi.stubGlobal('window', globalThis);
 		const state = new URL(opened(open)).searchParams.get(
 			'state',
@@ -205,6 +209,27 @@ describe('sign-in', () => {
 		await expect(
 			finishSignIn(plugin as never, 'the-code', state),
 		).resolves.toBe(false);
+	});
+
+	it('opens the browser synchronously once the link is prepared', async () => {
+		const open = vi.fn();
+		const plugin = createPlugin();
+		await prepareSignIn(plugin as never);
+		vi.stubGlobal('window', { ...globalThis, open });
+
+		// No await: iOS only honors opens inside the tap handler itself.
+		startSignIn(plugin as never);
+
+		expect(open).toHaveBeenCalledOnce();
+		vi.stubGlobal('window', globalThis);
+	});
+
+	it('reuses a pending sign-in when the settings re-render', async () => {
+		const plugin = createPlugin();
+		const first = await prepareSignIn(plugin as never);
+		const second = await prepareSignIn(plugin as never);
+
+		expect(second).toBe(first);
 	});
 
 	it('parses the code pasted from the callback page', () => {

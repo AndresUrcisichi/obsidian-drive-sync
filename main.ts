@@ -3,6 +3,8 @@ import {
 	BUILD_DEFAULTS,
 	finishSignIn,
 	getClientId,
+	getPreparedSignInUrl,
+	prepareSignIn,
 	getClientSecret,
 	isSignedIn,
 	parsePastedCode,
@@ -106,7 +108,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 		this.addCommand({
 			id: 'sign-in',
 			name: 'Sign in with Google',
-			callback: () => void startSignIn(this),
+			callback: () => startSignIn(this),
 		});
 
 		this.addCommand({
@@ -491,8 +493,26 @@ class SettingsTab extends PluginSettingTab {
 							: button
 									.setButtonText('Sign in with Google')
 									.setCta()
-									.onClick(() => void startSignIn(plugin)),
+									.onClick(() => startSignIn(plugin)),
 					);
+					if (!signedIn) {
+						// Ready before the tap: iOS only opens Safari synchronously.
+						void prepareSignIn(plugin);
+						setting.addButton((button) =>
+							button.setButtonText('Copy sign-in link').onClick(() => {
+								const url = getPreparedSignInUrl(plugin);
+								if (!url) {
+									new Notice('Set the client secret first.');
+									return;
+								}
+								void navigator.clipboard.writeText(url).then(() =>
+									new Notice(
+										'Sign-in link copied. Paste it in your browser.',
+									),
+								);
+							}),
+						);
+					}
 				},
 			},
 			{
@@ -589,7 +609,10 @@ class SettingsTab extends PluginSettingTab {
 							.setPlaceholder(
 								getClientSecret(plugin) ? '••••••••' : 'Client secret',
 							)
-							.onChange((value) => setClientSecret(plugin, value));
+							.onChange((value) => {
+								setClientSecret(plugin, value);
+								void prepareSignIn(plugin);
+							});
 					});
 				},
 			},

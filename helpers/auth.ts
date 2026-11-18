@@ -82,24 +82,39 @@ export const missingClientConfig = (t: ObsidianGoogleDrive) => {
 	return missing;
 };
 
-/**
- * Starts the OAuth authorization-code flow with PKCE. Google sends the code to
- * the static callback page, which forwards it to Obsidian through the
- * `obsidian://gdrive-vault-sync-auth` URI (or shows it for manual pasting).
- */
-export const startSignIn = async (t: ObsidianGoogleDrive) => {
-	const missing = missingClientConfig(t);
-	if (missing.length) {
-		new Notice(`Set the ${missing.join(', ')} in the plugin settings first.`);
+const readPending = (t: ObsidianGoogleDrive): PendingAuth | undefined => {
+	const raw = t.app.loadLocalStorage(PENDING_KEY) as string | null;
+	if (!raw) return;
+	try {
+		const pending = JSON.parse(raw) as PendingAuth;
+		if (Date.now() - pending.createdAt > PENDING_TTL_MS) return;
+		return pending;
+	} catch {
 		return;
 	}
+};
 
-	const pending: PendingAuth = {
-		verifier: randomString(64),
-		nonce: randomString(24),
-		createdAt: Date.now(),
-	};
-	t.app.saveLocalStorage(PENDING_KEY, JSON.stringify(pending));
+let preparedUrl: { url: string; nonce: string } | undefined;
+
+/**
+ * Builds the Google sign-in URL ahead of the click. iOS only lets a page open
+ * Safari synchronously inside the tap handler; awaiting the PKCE hash first
+ * made the tap silently do nothing. A still-valid pending sign-in is reused so
+ * re-rendering the settings never invalidates a code already on its way back.
+ */
+export const prepareSignIn = async (t: ObsidianGoogleDrive) => {
+	if (missingClientConfig(t).length) return;
+
+	let pending = readPending(t);
+	if (!pending) {
+		pending = {
+			verifier: randomString(64),
+			nonce: randomString(24),
+			createdAt: Date.now(),
+		};
+		t.app.saveLocalStorage(PENDING_KEY, JSON.stringify(pending));
+	}
+	if (preparedUrl?.nonce === pending.nonce) return preparedUrl.url;
 
 	// The callback page reads the vault name from the state so Obsidian routes
 	// the redirect to this vault when several are open.
@@ -121,7 +136,49 @@ export const startSignIn = async (t: ObsidianGoogleDrive) => {
 		state,
 	}).toString();
 
-	openInSystemBrowser(url.toString());
+	preparedUrl = { url: url.toString(), nonce: pending.nonce };
+	return preparedUrl.url;
+};
+
+/** The prepared URL if it is still valid, without any await. */
+export const getPreparedSignInUrl = (t: ObsidianGoogleDrive) => {
+	const pending = readPending(t);
+	return pending && preparedUrl?.nonce === pending.nonce
+		? preparedUrl.url
+		: undefined;
+};
+
+/**
+ * Starts the OAuth authorization-code flow with PKCE. Google sends the code to
+ * the static callback page, which forwards it to Obsidian through the
+ * `obsidian://gdrive-vault-sync-auth` URI (or shows it for manual pasting).
+ *
+ * Call from a tap/click handler: when the URL was prepared beforehand, the
+ * browser opens synchronously, which iOS requires.
+ */
+export const startSignIn = (t: ObsidianGoogleDrive) => {
+	const missing = missingClientConfig(t);
+	if (missing.length) {
+		new Notice(`Set the ${missing.join(', ')} in the plugin settings first.`);
+		return;
+	}
+
+	const ready = getPreparedSignInUrl(t);
+	if (ready) {
+		openInSystemBrowser(ready);
+		return;
+	}
+
+	// Not prepared yet (for example from the command palette): prepare, then
+	// ask for a second tap so the open happens inside a user gesture.
+	void prepareSignIn(t).then((url) => {
+		if (!url) return;
+		if (Platform.isDesktopApp) {
+			openInSystemBrowser(url);
+		} else {
+			new Notice('Sign-in is ready. Tap the sign-in button again.');
+		}
+	});
 };
 
 /**
@@ -145,16 +202,10 @@ const openInSystemBrowser = (url: string) => {
 };
 
 const takePending = (t: ObsidianGoogleDrive): PendingAuth | undefined => {
-	const raw = t.app.loadLocalStorage(PENDING_KEY) as string | null;
+	const pending = readPending(t);
 	t.app.saveLocalStorage(PENDING_KEY, null);
-	if (!raw) return;
-	try {
-		const pending = JSON.parse(raw) as PendingAuth;
-		if (Date.now() - pending.createdAt > PENDING_TTL_MS) return;
-		return pending;
-	} catch {
-		return;
-	}
+	preparedUrl = undefined;
+	return pending;
 };
 
 /**
